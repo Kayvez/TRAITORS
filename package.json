@@ -1,0 +1,8 @@
+{
+  "name": "tradimento-al-collegio",
+  "version": "1.0.0",
+  "description": "Un gioco di inganni nel convento: Fedeli e Traditori. Tabellone sull'iPad e un telefono per ogni giocatrice.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "test": "node test.js" },
+  "engines": { "node": ">=18" }
+}
