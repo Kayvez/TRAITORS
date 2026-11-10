@@ -1,417 +1,828 @@
 (() => {
   'use strict';
-  const D = window.TDATA;
-  const { h, esc, seal, post, fmt, toast, confetti, rulesModal } = window.UI;
+  const D = window.GAME_DATA;
+  let BOARD = D.BOARDS[60].squares, curSize = 0;
   const $ = (s, el = document) => el.querySelector(s);
-  let token = localStorage.getItem('tr_token');
-  let S = null, key = '', es = null, endAt = null;
-  let selSeal = null, typedName = '';
-  let peek = 0;                  // mostra il ruolo fino a…
-  let nightSel = null, recruitFlag = false;
-  let voteSel = null;
-  let revealedFor = sessionStorage.getItem('tr_revealed') || '';
-  let fb = null;                 // risposta appena data nel quiz
-  let mini = null;               // stato del mini-gioco in corso
-  let lastShield = null, lastPhase = null, lastAlive = null, rulesOpen = false;
+  const eur = (n) => '€' + n;
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-  const P = (id) => S.players.find((p) => p.id === id);
-  const me = () => (S && S.you ? P(S.you) : null);
-  const buzz = (p) => { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) { /* */ } };
+  let GROUPS = {}, STATIONS = [];
+  function useSize(size) {
+    size = size || 40;
+    if (size === curSize) return;
+    curSize = size;
+    BOARD = (D.BOARDS[size] || D.BOARDS[40]).squares;
+    GROUPS = {};
+    BOARD.forEach((sq, i) => { if (sq.type === 'street') (GROUPS[sq.group] = GROUPS[sq.group] || []).push(i); });
+    STATIONS = BOARD.map((q, i) => (q.type === 'station' ? i : -1)).filter((i) => i >= 0);
+  }
+  useSize(60);
+  const nm = (i) => D.nameOf(S ? S.settings.theme : 'italia', BOARD[i]);
+
+  let token = localStorage.getItem('dv_token');
+  let S = null, lastJson = '', es = null;
+  let tab = 'turno';
+  let draft = null;            // scambio in preparazione
+  let selEmoji = null, typedName = '';
+  let joinBuilt = false;
+  let delta = null;            // { v, until }
+  let salePick = null;         // { to, price } mentre preparo una vendita diretta
+  let pick = null;             // { kind:'ace', key } mentre si sceglie il bersaglio
+  let lastLogSeen = null;
+  let lastCash = null, lastTurnMe = false, lastTradeIds = '', lastDebt = false;
 
   // ---------- rete ----------
+  async function post(path, body) {
+    try {
+      const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+      return await r.json();
+    } catch (e) { return { ok: false, error: 'Niente connessione al gioco. Controlla il Wi-Fi.' }; }
+  }
+  let toastTimer;
+  function toast(msg, bad) {
+    const t = $('#toast');
+    t.textContent = msg;
+    t.className = 'show' + (bad ? ' bad' : '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { t.className = ''; }, bad ? 5000 : 3600);
+  }
+  // i tasti del turno non si premono a raffica: dopo un tocco si aspetta un attimo
+  const FLOW = new Set(['roll', 'buy', 'decline', 'endTurn', 'dareAnswer', 'busPick', 'warpTo', 'travel', 'payJail', 'useJailCard', 'offerSale', 'saleAccept', 'saleDecline', 'claimTake', 'claimPass']);
+  let flowLock = 0;
+  async function act(a) {
+    if (FLOW.has(a.type)) {
+      if (Date.now() < flowLock) return { ok: false, soft: true };
+      flowLock = Date.now() + 250;
+    }
+    const r = await post('/api/act', Object.assign({ token }, a));
+    if (!r.ok) {
+            if (r.error) toast(r.error, !r.soft);
+      if (/Sessione scaduta/.test(r.error || '')) logout();
+    }
+    return r;
+  }
+  function logout() {
+    token = null; localStorage.removeItem('dv_token');
+    draft = null; joinBuilt = false; lastJson = '';
+    connect();
+  }
   function connect() {
     if (es) es.close();
     es = new EventSource('/events' + (token ? '?token=' + encodeURIComponent(token) : ''));
     es.onmessage = (ev) => {
-      let s; try { s = JSON.parse(ev.data); } catch (e) { return; }
-      const k = JSON.stringify(s, (n, v) => (n === 'left' ? undefined : v));
-      if (k === key) return;
-      key = k; onState(s);
+      if (ev.data === lastJson) return;
+      lastJson = ev.data;
+      try { onState(JSON.parse(ev.data)); } catch (e) { console.error(e); }
     };
     es.onerror = async () => {
-      if (token) { const r = await post('/api/act', { token, type: 'noop' }); if (/Sessione scaduta/.test(r.error || '')) { logout(); return; } }
+      if (token) {
+        const r = await post('/api/act', { token, type: 'noop' });
+        if (/Sessione scaduta/.test(r.error || '')) { logout(); return; }
+      }
       if (es.readyState === 2) setTimeout(connect, 2000);
     };
   }
-  function logout() { token = null; localStorage.removeItem('tr_token'); key = ''; connect(); }
-  let busy = 0;
-  async function act(a) {
-    if (Date.now() < busy) return { ok: false };
-    busy = Date.now() + 350;
-    const r = await post('/api/act', Object.assign({ token }, a));
-    if (!r.ok && r.error) { if (/Sessione scaduta/.test(r.error)) logout(); else toast(r.error, true); }
-    return r;
+
+  // ---------- utilità di stato ----------
+  const P = (id) => S.players.find((p) => p.id === id);
+  const me = () => P(S.you);
+  // ordinate per colore (i colori nell'ordine del tabellone), poi stazioni e società
+  const propRank = (i) => { const sq = BOARD[i]; return sq.type === 'street' ? Object.keys(GROUPS).indexOf(sq.group) : sq.type === 'station' ? 500 : 900; };
+  const propsOf = (pid) => Object.keys(S.props).map(Number).filter((i) => S.props[i].owner === pid).sort((a, b) => propRank(a) - propRank(b) || a - b);
+  const ownsAll = (pid, group) => GROUPS[group].every((i) => S.props[i].owner === pid);
+  const tradable = (i) => { const sq = BOARD[i]; return !(sq.type === 'street' && GROUPS[sq.group].some((j) => S.props[j].houses > 0)); };
+  const colorOf = (i) => { const sq = BOARD[i]; return sq.type === 'street' ? D.GROUP_COLORS[sq.group] : sq.type === 'station' ? '#445066' : '#9aa7b8'; };
+  const textOn = (c) => (['#f4d93b', '#8fd3f4'].includes(c) ? '#222' : '#fff');
+  function rentNow(i) {
+    const sq = BOARD[i], pr = S.props[i];
+    const up = (n) => (S.event && S.event.key === 'rentUp' ? Math.round(n * 1.5 / 10) * 10 : n);
+    if (sq.type === 'street') return pr.houses >= 6 ? eur(up(Math.round(sq.rent[5] * 1.6 / 10) * 10)) : pr.houses > 0 ? eur(up(sq.rent[pr.houses])) : eur(up(sq.rent[0] * (ownsAll(pr.owner, sq.group) ? 2 : 1)));
+    if (sq.type === 'station') return eur(up(25 * Math.pow(2, STATIONS.filter((j) => S.props[j].owner === pr.owner).length - 1)));
+    return '4× / 10× dadi';
+  }
+  const PIPS = { 1: [4], 2: [0, 8], 3: [0, 4, 8], 4: [0, 2, 6, 8], 5: [0, 2, 4, 6, 8], 6: [0, 2, 3, 5, 6, 8] };
+  const dieHTML = (n) => `<div class="dot-die land">${[0, 1, 2, 3, 4, 5, 6, 7, 8].map((i) => `<i class="${PIPS[n].includes(i) ? 'on' : ''}"></i>`).join('')}</div>`;
+  const speedHTML = (f) => `<div class="dot-die speed land"><b>${f === 'J' ? '🃏' : f === 'B' ? '🚌' : f}</b></div>`;
+  const diceHTML = (d) => (d && d.d1 ? `<div class="dice">${dieHTML(d.d1)}${dieHTML(d.d2)}${d.d3 ? speedHTML(d.d3) : ''}</div>` : '');
+  const eventHTML = () => (S.event && S.status === 'playing' ? `<div class="evbox">${S.event.icon} <b>${esc(S.event.title)}</b> · ${esc(S.event.text)}</div>` : '');
+
+  function sideText(side, giverId) {
+    const parts = [];
+    if (side.cash) parts.push(eur(side.cash));
+    side.props.forEach((i) => parts.push(nm(i) + (S.props[i] && S.props[i].mortgaged ? ' (ipotecata)' : '')));
+    if (side.jail) parts.push(`${side.jail} carta${side.jail > 1 ? 'e' : ''} "esci di prigione"`);
+    return parts.length ? parts.join(', ') : 'niente';
+  }
+
+  // ---------- notifiche ----------
+  // suoni sul telefono (si sbloccano al primo tocco)
+  let pctx = null, silentP = null, pSound = true;
+  try { pSound = localStorage.getItem('dv_psound') !== '0'; } catch (e) { /* */ }
+  function pEnsure() {
+    if (!pSound) return false;
+    if (!pctx) { try { pctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return false; } }
+    if (pctx.state !== 'running') pctx.resume();
+    if (!silentP) {
+      try {
+        const n = 8000, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+        const w = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+        w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+        v.setUint32(24, 8000, true); v.setUint32(28, 16000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
+        silentP = new Audio(URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }))); silentP.loop = true; silentP.setAttribute('playsinline', '');
+      } catch (e) { /* */ }
+    }
+    if (silentP && silentP.paused) silentP.play().catch(() => {});
+    return pctx.state === 'running';
+  }
+  ['pointerdown', 'touchend', 'click'].forEach((ev) => document.addEventListener(ev, pEnsure, { passive: true }));
+  function ptone(f, t0, d, type, vol) {
+    const o = pctx.createOscillator(), g = pctx.createGain();
+    o.type = type || 'sine'; o.frequency.value = f;
+    const t = pctx.currentTime + t0;
+    g.gain.setValueAtTime(vol || 0.25, t); g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+    o.connect(g); g.connect(pctx.destination); o.start(t); o.stop(t + d + 0.03);
+  }
+  function psfx(k) {
+    if (!pSound || !pEnsure()) return;
+    if (k === 'turn') { ptone(660, 0, 0.14); ptone(880, 0.14, 0.14); ptone(1320, 0.28, 0.3); }
+    if (k === 'gain') { ptone(880, 0, 0.1); ptone(1175, 0.09, 0.16); }
+    if (k === 'lose') { ptone(330, 0, 0.12, 'triangle'); ptone(247, 0.1, 0.2, 'triangle'); }
+    if (k === 'alert') { ptone(500, 0, 0.12, 'square', 0.15); ptone(500, 0.18, 0.12, 'square', 0.15); }
+  }
+  function buzz(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) { /* */ } }
+  function notifications() {
+    const m = me();
+    if (!m || S.status !== 'playing') return;
+    const myTurn = S.turn === S.you && ['roll', 'buy', 'action'].includes(S.phase);
+    if (S.turn === S.you && S.phase === 'roll' && !lastTurnMe) { toast('🎲 Tocca a te!'); buzz([200, 100, 200]); psfx('turn'); }
+    lastTurnMe = S.turn === S.you && S.phase === 'roll' ? true : (S.turn === S.you ? lastTurnMe : false);
+    const ids = S.trades.filter((t) => t.to === S.you).map((t) => t.id).join(',');
+    if (ids && ids !== lastTradeIds && ids.split(',').some((x) => !lastTradeIds.split(',').includes(x))) { toast('🤝 Hai una proposta di scambio!'); buzz([120, 80, 120]); psfx('alert'); }
+    lastTradeIds = ids;
+    const inDebt = S.debts.some((d) => d.pid === S.you);
+    if (inDebt && !lastDebt) buzz([300]);
+    lastDebt = inDebt;
+    if (S.phase === 'auction' && S.auction && S.auction.active.includes(S.you) && !notifications.auc) { notifications.auc = true; buzz([100]); }
+    if (S.phase !== 'auction') notifications.auc = false;
   }
 
   function onState(s) {
-    const prev = S;
+    useSize(s.size);
+    if (s.phase !== 'buy' || s.turn !== s.you) salePick = null;
     S = s;
-    endAt = s.until && !s.paused ? Date.now() + s.left : null;
-    if (s.you && !me()) { logout(); return; }
-    const m = s.me;
-    if (prev && m) {
-      if (lastShield === false && m.shield) toast('🛡️ Hai vinto uno scudo! Una volta, ti salva dall\'eliminazione notturna.');
-      if (lastShield === true && !m.shield && m.alive && s.phase === 'dawn') toast('🛡️ Lo scudo ti ha salvata stanotte!');
-      if (lastAlive === true && !m.alive) { buzz([300, 100, 300]); }
-      if (prev.phase !== s.phase) phaseBuzz(s, m);
+    if (token && s.you === null) { logout(); return; }
+    const m = me();
+    if (m && m.cash !== null) {
+      if (lastCash !== null && lastCash > 0 && m.cash !== lastCash) {
+        delta = { v: m.cash - lastCash, until: Date.now() + 2400 };
+        psfx(m.cash > lastCash ? 'gain' : 'lose');
+        setTimeout(render, 2500);
+      }
+      lastCash = m.cash;
     }
-    if (m) { lastShield = !!m.shield; lastAlive = !!m.alive; }
-    // la prima volta, le regole si aprono da sole appena entri
-    if (me() && !localStorage.getItem('tr_rules_seen') && !rulesOpen) { rulesOpen = true; setTimeout(() => rulesModal(() => { localStorage.setItem('tr_rules_seen', '1'); }), 400); }
-    if (!prev || prev.phase !== s.phase || (prev.mission && s.mission && prev.mission.seq !== s.mission.seq)) { nightSel = null; recruitFlag = false; voteSel = null; fb = null; if (!prev || prev.phase !== 'mission') mini = null; }
-    if (prev && prev.phase === 'vote' && s.phase === 'vote' && prev.vote && s.vote && prev.vote.revote !== s.vote.revote) voteSel = null;
+    notifications();
+    logToasts();
     render();
   }
-  function phaseBuzz(s, m) {
-    if (!m || !m.alive) return;
-    if (s.phase === 'night' && m.role === 'traitor' && s.night && s.night.murder) buzz([200, 80, 200]);
-    else if (['mission', 'table', 'vote'].includes(s.phase)) buzz([120, 60, 120]);
-    else if (s.phase === 'recruit' && s.recruit && s.recruit.mine) buzz([300, 100, 300]);
+  // ---------- avvisi a tutto schermo (come sul tabellone) ----------
+  const bQ = [];
+  let bBusy = false, bEl = null, lastNoticeSeq = null, lastCardSeq = null, lastEventSeq = null, lastDiceSeq = null;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  function banner(icon, title, text, cls, amount) {
+    if (bQ.length >= 4) { const i = bQ.findIndex((x) => x.cls !== 'big'); bQ.splice(i >= 0 ? i : 0, 1); } // se ce ne sono troppi, salta i meno importanti
+    bQ.push({ icon, title, text, cls, amount });
+    if (!bBusy) runBanner();
+  }
+  async function runBanner() {
+    bBusy = true;
+    if (!bEl) { bEl = document.createElement('div'); bEl.id = 'banner'; document.body.appendChild(bEl); bEl.addEventListener('click', () => { bEl.className = ''; }); }
+    while (bQ.length) {
+      const a = bQ.shift();
+      bEl.className = 'show ' + (a.cls || '');
+      bEl.innerHTML = `<div class="bi">${a.icon}</div><div class="bt">${esc(a.title)}</div>${a.amount ? `<div class="ba">${esc(a.amount)}</div>` : ''}<div class="bx">${esc(a.text || '')}</div>`;
+      if (a.cls === 'bad') psfx('lose'); else if (a.cls === 'good') psfx('gain'); else psfx('alert');
+      await wait(bQ.length > 1 ? 2100 : a.cls === 'big' ? 3800 : 3000);
+      bEl.className = '';
+      await wait(350);
+    }
+    bBusy = false;
+  }
+  const euroIn = (t) => { const m = /€\s?(\d+)/.exec(t || ''); return m ? '€' + m[1] : ''; };
+  const plain = (t) => String(t || '').replace(/^[^\p{L}\p{N}€]+/u, '');
+  const DECKI = { fortuna: ['🍀', 'Fortuna'], sorpresa: ['🎁', 'Sorpresa'], imprevisto: ['⚠️', 'Imprevisto'] };
+  function announceFrom(fresh) {
+    const me0 = me();
+    const mine = (t) => !!(me0 && t.includes(me0.name));
+    for (const l of fresh) {
+      const t = l.text;
+      if (l.kind === 'rent') { banner('💸', mine(t) ? 'Devi pagare un affitto' : 'Affitto', plain(t), 'bad', euroIn(t)); if (mine(t)) buzz([120, 60, 120]); }
+      else if (l.kind === 'tax') { banner('🧾', 'Tassa / multa', plain(t), 'bad', euroIn(t)); if (mine(t)) buzz([120, 60, 120]); }
+      else if (l.kind === 'go') banner(/d'oro/.test(t) ? '🎰' : '➡️', /d'oro/.test(t) ? 'Partenza d\'oro: doppio!' : /piatto/.test(t) ? 'Piatto dell\'aperitivo!' : 'Partenza!', plain(t), /d'oro/.test(t) ? 'big' : 'good', euroIn(t));
+      else if (l.kind === 'pay' && /€/.test(t)) banner('💶', 'Pagamento', plain(t), 'bad', euroIn(t));
+      else if (l.kind === 'land' && /oggi niente affitto/.test(t)) banner('🚧', 'Niente affitto oggi!', plain(t), 'big');
+      else if (l.kind === 'mission') banner('🎯', 'Missione compiuta!', plain(t), 'big', euroIn(t));
+      else if (l.kind === 'dare') banner('🎭', /rifiuta/.test(t) ? 'Sfida rifiutata' : 'Sfida superata!', plain(t), /rifiuta/.test(t) ? 'bad' : 'good', euroIn(t));
+      else if (l.kind === 'sale') banner('🤝', 'Offerta diretta', plain(t), '', euroIn(t));
+      else if (l.kind === 'dice' && /TRIS/.test(t)) banner('✨', 'TRIS!', plain(t), 'big');
+      else if (l.kind === 'dice' && /navetta/.test(t)) banner('🚌', 'Navetta!', plain(t));
+      else if (l.kind === 'move' && /Jolly/.test(t)) banner('🃏', 'Jolly!', plain(t));
+      else if (l.kind === 'move' && /scambiano/.test(t)) banner('🔀', 'Si cambia posto!', plain(t));
+      else if (l.kind === 'ace') banner('🃏', 'Asso nella manica', plain(t), /scudo/i.test(t) ? 'good' : '');
+      else if (l.kind === 'cheat') banner('🕵️', 'Furbetti!', plain(t), 'big', euroIn(t));
+      else if (l.kind === 'jail' && /va in prigione|tre doppi/.test(t)) banner('🚔', 'In prigione!', plain(t), 'bad');
+      else if (l.kind === 'bankrupt') banner('💀', 'Fuori dal gioco', plain(t), 'bad');
+      else if (l.kind === 'build' && mine(t)) toast(t);
+    }
+  }
+  function logToasts() {
+    const last = S.log.length ? S.log[S.log.length - 1].id : 0;
+    const first = lastLogSeen === null;
+    const fresh = first ? [] : S.log.filter((l) => l.id > lastLogSeen);
+    lastLogSeen = last;
+    const rolled = lastDiceSeq !== null && S.dice.seq !== lastDiceSeq;
+    lastDiceSeq = S.dice.seq;
+    if (first) { lastNoticeSeq = S.notice ? S.notice.seq : 0; lastCardSeq = S.card ? S.card.seq : 0; lastEventSeq = S.event ? S.event.seq : 0; return; }
+    const lag = rolled ? 1200 : 150; // dopo un lancio aspetta che il tabellone abbia mostrato la mossa
+    const items = [];
+    // evento di città
+    if (S.event && S.event.seq !== lastEventSeq) { lastEventSeq = S.event.seq; const e = S.event; items.push(() => banner(e.icon, e.title, e.text, 'big')); }
+    // carta pescata
+    if (S.card && S.card.seq !== lastCardSeq) { lastCardSeq = S.card.seq; const c = S.card, who = P(c.pid), d = DECKI[c.deck] || ['🃏', 'Carta']; items.push(() => banner(d[0], `${d[1]}${who ? ' · ' + who.emoji + ' ' + who.name : ''}`, plain(c.text), 'big')); }
+    // avviso di casella speciale
+    if (S.notice && S.notice.seq !== lastNoticeSeq) { lastNoticeSeq = S.notice.seq; const n = S.notice; items.push(() => { banner(n.icon, n.title, n.text, n.tone === 'bad' ? 'bad' : n.tone === 'good' ? 'good' : 'big'); if (n.tone === 'bad') buzz([100, 50, 100]); }); }
+    const snap = fresh.filter((l) => !['event', 'card', 'notice'].includes(l.kind));
+    setTimeout(() => { snap.length && announceFrom(snap); items.forEach((f) => f()); }, lag);
   }
 
-  // ---------- pezzi di interfaccia ----------
-  const roleName = (r) => (r === 'traitor' ? 'Traditrice' : 'Fedele');
-  function header() {
-    const m = me(); const mm = S.me;
-    const showing = Date.now() < peek;
-    const chip = mm && mm.role ? `<button class="rolechip ${showing ? mm.role : ''}" data-act="peek">${showing ? (mm.role === 'traitor' ? '🗡️ Traditrice' : '🕊️ Fedele') : '🔒 Il mio ruolo'}</button>` : mm && mm.narrator ? '<span class="rolechip narr">🎙️ Narratrice</span>' : '';
-    return `<header class="top"><div class="who">${seal(m.seal, 44, { dead: !m.alive && S.status === 'playing' })}<div><b>${esc(m.name)}</b>${S.status === 'playing' ? `<small>Giorno ${Math.max(1, S.day)} · 💰 €${S.pot}</small>` : ''}</div></div>${chip}<button class="hq" data-act="help">?</button></header>`;
-  }
-  function timerBar() {
-    if (!S.until) return '';
-    return `<div class="tbar"><span id="tm">${fmt(S.left)}</span><div class="bar"><i id="bar"></i></div></div>`;
-  }
-  const waitCard = (icon, title, text) => `<div class="card center"><div class="bigi">${icon}</div><h2>${title}</h2><p>${text}</p>${timerBar()}</div>`;
-  const seals = (list, cls, sel, dis) => `<div class="tiles">${list.map((p) => `<button class="tile ${sel === p.id ? 'sel' : ''} ${cls || ''}" data-id="${p.id}" ${dis && dis(p) ? 'disabled' : ''}>${seal(p.seal, 56, { dead: !p.alive })}<span>${esc(p.name)}</span>${p.role === 'traitor' && S.me && S.me.role === 'traitor' ? '<em>🗡️</em>' : ''}</button>`).join('')}</div>`;
-
-  // ---------- schermate ----------
+  // ---------- schermata di ingresso ----------
   function renderJoin() {
-    const taken = new Set(S.players.map((p) => p.seal));
-    const lobby = S.status === 'lobby';
-    return `<div class="wrap"><div class="logo">${esc(S.title)}</div><div class="sub">${lobby ? 'Scegli il tuo nome e il tuo sigillo' : 'La partita è già iniziata'}</div>
-      ${lobby ? `<div class="card"><input id="nm" maxlength="14" placeholder="Il tuo nome" value="${esc(typedName)}" autocomplete="off">
-      <div class="sealgrid">${D.SEALS.map((s) => `<button class="sg ${selSeal === s.id ? 'sel' : ''}" data-act="pickSeal" data-id="${s.id}" ${taken.has(s.id) ? 'disabled' : ''}>${seal(s.id, 54)}<small>${s.name}</small></button>`).join('')}</div>
-      <button class="btn big" data-act="join">Entra nel convento</button></div>`
-      : `<div class="card"><p>Se eri già dentro, riprendi il tuo posto:</p>${S.players.map((p) => `<button class="btn ghost" data-act="claim" data-id="${p.id}" style="margin:4px 0;display:flex;align-items:center;gap:10px">${seal(p.seal, 36)} ${esc(p.name)}</button>`).join('')}</div>`}
-    </div>`;
-  }
-
-  function renderLobby() {
-    const m = me(); const host = S.hostId === m.id;
-    const st = S.settings; const n = S.players.filter((p) => !p.narrator).length;
-    const narr = S.players.find((p) => p.narrator);
-    return `<div class="wrap">
-      <div class="card"><h3>Ospiti (${n}${narr ? ' + narratrice' : ''})</h3>${S.players.map((p) => `<div class="prow">${seal(p.seal, 40)}<b>${esc(p.name)}</b>${p.id === S.hostId ? ' ⭐' : ''}${p.narrator ? ' 🎙️' : ''}${p.id === m.id ? '<small> (tu)</small>' : ''}</div>`).join('')}
-        <p class="muted">${n < 4 ? `Ne servono almeno 4 per giocare.` : `Con ${n} giocatrici: ${S.traitorCount} ${S.traitorCount === 1 ? 'traditrice' : 'traditrici'}.`}</p></div>
-      <div class="card"><label class="sw"><input type="checkbox" data-act="narr" ${m.narrator ? 'checked' : ''}> <span>🎙️ Faccio la <b>narratrice</b> (non gioco, vedo tutto e governo i tempi)</span></label></div>
-      ${host ? `<div class="card"><h3>Impostazioni ⭐</h3><div class="chips">
-        <button class="chip" data-act="set" data-k="tableSec">🗣️ Tavola: ${st.tableSec / 60} min</button>
-        <button class="chip" data-act="set" data-k="traitors">🗡️ Traditrici: ${st.traitors ? st.traitors : 'automatico'}</button>
-        <button class="chip ${st.recruit ? 'on' : ''}" data-act="set" data-k="recruit">🌒 Reclutamento</button>
-        <button class="chip ${st.ghostsSee ? 'on' : ''}" data-act="set" data-k="ghostsSee">👻 Chi è fuori vede i ruoli</button></div>
-        <button class="btn big ${n < 4 ? 'off' : ''}" data-act="start">Inizia la partita</button></div>`
-        : `<div class="card"><p class="muted">Aspetta che ${esc(P(S.hostId).name)} ⭐ avvii la partita (o dal tabellone).</p></div>`}
-      <button class="btn ghost" data-act="help">❓ Come si gioca</button><button class="btn ghost" data-act="leave">Esci</button></div>`;
-  }
-
-  function renderReveal() {
-    const mm = S.me; const m = me();
-    if (mm.narrator) return `<div class="wrap">${waitCard('🎙️', 'I ruoli sono assegnati', 'Le giocatrici stanno scoprendo il loro ruolo.')}${narrPanel()}</div>`;
-    const shown = revealedFor === S.gameId;
-    if (!shown) return `<div class="wrap"><div class="card center flip" data-act="reveal"><div class="bigi">🕯️</div><h2>Il tuo ruolo è un segreto</h2><p>Assicurati che nessuna guardi lo schermo, poi tocca la carta.</p><button class="btn big" data-act="reveal">Scopri il mio ruolo</button></div></div>`;
-    const t = mm.role === 'traitor';
-    const mates = S.players.filter((p) => p.role === 'traitor' && p.id !== m.id);
-    return `<div class="wrap"><div class="card rolecard ${mm.role}"><div class="bigi">${t ? '🗡️' : '🕊️'}</div><h2>Sei ${t ? 'una TRADITRICE' : 'una Fedele'}</h2>
-      <p>${t ? 'Di notte elimini una Fedele. Di giorno mentì, accusa e non farti scoprire.' : 'Scopri chi sono le Traditrici e bandiscile prima che sia troppo tardi.'}</p>
-      ${t ? `<div class="mates"><b>Le tue compagne:</b>${mates.length ? mates.map((p) => `<span>${seal(p.seal, 34)} ${esc(p.name)}</span>`).join('') : ' sei da sola!'}</div>` : ''}
-      </div>${m.ready ? '<div class="card center"><p>Perfetto! Aspettiamo le altre… 🕯️</p></div>' : '<button class="btn big" data-act="ready">Ho capito, sono pronta</button>'}
-      <button class="btn ghost" data-act="hide">🙈 Nascondi</button></div>`;
-  }
-
-  function ghostBox() {
-    return `<div class="card ghost"><h3>👻 Sei fuori dal gioco</h3><p class="muted">${S.settings.ghostsSee ? 'Ora vedi i ruoli di tutte: guarda in silenzio, non rovinare il gioco!' : 'Guarda il tabellone e fai il tifo.'}</p>
-      ${S.settings.ghostsSee ? S.players.filter((p) => !p.narrator).map((p) => `<div class="prow">${seal(p.seal, 34, { dead: !p.alive })}<b>${esc(p.name)}</b><span class="rb ${p.role}">${p.role === 'traitor' ? '🗡️' : '🕊️'}</span>${p.shield ? ' 🛡️' : ''}${p.alive ? '' : ' 💀'}</div>`).join('') : ''}</div>`;
-  }
-  function narrPanel() {
-    const rows = S.players.filter((p) => !p.narrator).map((p) => `<div class="prow">${seal(p.seal, 34, { dead: !p.alive })}<b>${esc(p.name)}</b><span class="rb ${p.role}">${p.role === 'traitor' ? '🗡️ Traditrice' : '🕊️ Fedele'}</span>${p.shield ? ' 🛡️' : ''}${p.alive ? '' : ' 💀'}</div>`).join('');
-    const picks = S.night && S.night.picks ? Object.entries(S.night.picks).map(([k, x]) => `<p>🗡️ ${esc(P(Number(k)).name)} → ${esc(P(x.target).name)}${x.recruit ? ' (recluta)' : ''}</p>`).join('') : '';
-    return `<div class="card narr"><h3>🎙️ Narratrice</h3>${S.until ? timerBar() : ''}
-      <div class="row"><button class="btn small" data-act="nskip">⏭ Avanti</button><button class="btn small ghost" data-act="next60">⏱ +1 min</button><button class="btn small ghost" data-act="npause">${S.paused ? '▶ Riprendi' : '⏸ Pausa'}</button></div>
-      ${picks}<div class="rolelist">${rows}</div></div>`;
-  }
-
-  function renderNight() {
-    const mm = S.me; const m = me();
-    if (mm.narrator) return `<div class="wrap">${waitCard('🌙', `Notte ${S.day}`, 'Le Traditrici scelgono in silenzio.')}${narrPanel()}</div>`;
-    if (!mm.alive) return `<div class="wrap">${waitCard('🌙', 'È notte', 'Il convento dorme.')}${ghostBox()}</div>`;
-    if (mm.role === 'traitor') {
-      const n = S.night;
-      if (!n.murder) return `<div class="wrap dark">${waitCard('🗡️', 'Stanotte riposi', 'È ancora presto (o siete troppo poche) per colpire. Fingi di dormire.')}</div>`;
-      const cands = S.players.filter((p) => !p.narrator && p.alive && p.role !== 'traitor');
-      const mine = n.myPick;
-      const others = Object.entries(n.picks || {}).filter(([k]) => Number(k) !== m.id).map(([k, x]) => `<p class="muted">🗡️ ${esc(P(Number(k)).name)} ha scelto <b>${esc(P(x.target).name)}</b>${x.recruit ? ' (recluta)' : ''}</p>`).join('');
-      return `<div class="wrap dark"><div class="card"><h2>🗡️ Chi eliminate stanotte?</h2><p class="muted">Se siete più Traditrici, scegliete la stessa persona. Parlate a bassa voce… o meglio, non parlate!</p>
-        ${seals(cands, '', nightSel || (mine && mine.target))}${others}
-        ${n.canRecruit ? `<label class="sw"><input type="checkbox" data-act="rec" ${recruitFlag || (mine && mine.recruit) ? 'checked' : ''}> <span>🌒 <b>Recluta</b> invece di eliminare: se accetta diventa Traditrice, se rifiuta viene eliminata.</span></label>` : ''}
-        <button class="btn big" data-act="nightGo" ${nightSel || mine ? '' : 'disabled'}>${mine ? 'Cambia scelta' : 'Conferma'}</button>${mine ? '<p class="muted">✅ Scelta inviata. Aspetta le altre.</p>' : ''}${timerBar()}</div></div>`;
+    const app = $('#app');
+    if (!joinBuilt) {
+      app.innerHTML = `<div class="wrap">
+        <div class="logo">${esc(D.TITLE)}</div>
+        <div class="sub">Scegli nome e pedina</div>
+        <div class="card">
+          <input id="nameInp" class="inp" maxlength="14" placeholder="Il tuo nome" autocomplete="off" value="${esc(typedName)}">
+          <div id="emojiGrid" class="emojis"></div>
+          <button class="btn gold" data-act="join">Entra in partita</button>
+        </div>
+        <div id="reclaim"></div></div>`;
+      $('#nameInp').addEventListener('input', (e) => { typedName = e.target.value; });
+      joinBuilt = true;
     }
-    return `<div class="wrap dark"><div class="card center night"><div class="candle">🕯️</div><h2>Chiudi gli occhi</h2><p>È notte. Posa il telefono sul tavolo e non aprire gli occhi finché non lo dice il tabellone.</p>${timerBar()}</div></div>`;
-  }
-  function renderRecruit() {
-    const mm = S.me; const r = S.recruit;
-    if (r && r.mine) return `<div class="wrap dark"><div class="card center night"><div class="bigi">🌒</div><h2>Un sussurro nel buio…</h2><p>Le Traditrici ti offrono un posto con loro. <b>Accetti di tradire?</b><br><small>Se rifiuti, verrai eliminata.</small></p><button class="btn big wine" data-act="recYes">🗡️ Accetto</button><button class="btn big ghost" data-act="recNo">Rifiuto</button>${timerBar()}</div></div>`;
-    if (mm.narrator) return `<div class="wrap">${waitCard('🌒', 'Reclutamento', 'Una Fedele sta decidendo se tradire.')}${narrPanel()}</div>`;
-    if (mm.role === 'traitor' && mm.alive) return `<div class="wrap dark">${waitCard('🌒', 'Hai fatto la tua offerta', 'Aspetta la risposta…')}</div>`;
-    return mm.alive ? renderNightQuiet() : `<div class="wrap">${waitCard('🌙', 'È notte', 'Il convento dorme.')}${ghostBox()}</div>`;
-  }
-  const renderNightQuiet = () => `<div class="wrap dark"><div class="card center night"><div class="candle">🕯️</div><h2>Chiudi gli occhi</h2><p>È ancora notte. Tieni il telefono sul tavolo.</p>${timerBar()}</div></div>`;
-
-  function renderDawn() {
-    const mm = S.me; const d = S.dawn || {};
-    const was = d.victim === S.you;
-    if (mm.narrator) return `<div class="wrap">${waitCard('☀️', 'Mattina', 'Guarda il tabellone.')}${narrPanel()}</div>`;
-    return `<div class="wrap">${waitCard(was ? '💀' : '☀️', was ? 'Sei stata eliminata' : 'Guarda il tabellone', was ? 'Le Traditrici ti hanno colpita. Da ora guardi in silenzio.' : 'Si scopre cosa è successo stanotte…')}${!mm.alive ? ghostBox() : ''}</div>`;
+    const taken = new Set(S.players.map((p) => p.emoji));
+    if (selEmoji && taken.has(selEmoji)) selEmoji = null;
+    $('#emojiGrid').innerHTML = D.TOKENS.map((e) => `<button class="${taken.has(e) ? 'taken' : ''}${e === selEmoji ? ' sel' : ''}" data-act="pick" data-e="${e}">${e}</button>`).join('');
+    const off = S.players.filter((p) => !p.connected && !p.bankrupt);
+    const started = S.status !== 'lobby';
+    $('#reclaim').innerHTML = (off.length || started) ? `<div class="card"><h3>${started ? 'La partita è già iniziata' : 'Eri già dentro?'}</h3>
+      <p class="muted">${off.length ? 'Se hai cambiato telefono o ricaricato la pagina, tocca il tuo nome:' : 'Aspetta la prossima partita.'}</p>
+      <div class="chips">${off.map((p) => `<button class="chip" data-act="claim" data-id="${p.id}">${p.emoji} ${esc(p.name)}</button>`).join('')}</div></div>` : '';
+    if (S.status === 'ended') $('#reclaim').innerHTML = '<div class="card"><h3>La partita è finita</h3><p class="muted">Chiedi di iniziarne una nuova dal tabellone.</p></div>';
   }
 
-  // ---------- missioni ----------
-  function renderMission() {
-    const mm = S.me; const M = D.MISSIONS[S.mission.type];
-    if (mm.narrator) return `<div class="wrap">${waitCard(M.icon, M.name, `${S.mission.done}/${S.mission.total} hanno finito`)}${narrPanel()}</div>`;
-    if (!mm.alive) return `<div class="wrap">${waitCard(M.icon, M.name, 'Le altre stanno giocando.')}${ghostBox()}</div>`;
-    let body;
-    if (S.mission.myDone) body = waitCard('✅', 'Fatto!', `Aspetta le altre (${S.mission.done}/${S.mission.total})…`);
-    else if (S.mission.type === 'quiz') body = quizHTML();
-    else if (S.mission.type === 'memory') body = memoryHTML();
-    else body = intruderHTML();
-    const sab = mm.canSabotage ? `<button class="btn small wine sab" data-act="sab">🗡️ Sabota la missione (una volta sola)</button>` : '';
-    return `<div class="wrap"><div class="mhead">${M.icon} <b>${M.name}</b></div>${body}${sab}</div>`;
+  // ---------- parti della schermata di gioco ----------
+  function fmtLeft(ms) { const t = Math.max(0, Math.floor(ms / 1000)); return Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0'); }
+  function extraBar(m) {
+    let h = '';
+    if (S.status !== 'playing') return h;
+    const bits = [];
+    if (S.endsAt) bits.push(`<span>⏰ <b class="cd" data-end="${S.endsAt}">${fmtLeft(S.endsAt - Date.now())}</b></span>`);
+    if (S.teamsOn && m.team != null) { const mates = S.players.filter((q) => q.team === m.team && q.id !== m.id).map((q) => q.emoji + ' ' + esc(q.name)).join(', '); bits.push(`<span>👯 ${TEAMICON[m.team] || ''} con ${mates}</span>`); }
+    if (S.bountyId === S.you) bits.push('<span class="bad">💰 Hai la taglia! Chi ti fa pagare guadagna</span>');
+    else if (S.bountyId) { const b = P(S.bountyId); bits.push(`<span>💰 Taglia su ${b.emoji} ${esc(b.name)}</span>`); }
+    if (bits.length) h += `<div class="xbar">${bits.join('')}</div>`;
+    if (S.myMission) h += `<div class="mission">🎯 <b>Missione segreta:</b> ${esc(S.myMission)} <small>(+€300)${m.missionsDone ? ' · fatte: ' + m.missionsDone : ''}</small></div>`;
+    return h;
   }
-  function quizHTML() {
-    const q = S.mission.qs, my = S.mission.my || [];
-    let i = my.findIndex((x) => x === null);
-    if (fb && my[fb.q] && Date.now() < fb.until) i = fb.q; else if (fb && Date.now() >= fb.until) fb = null;
-    if (i < 0) return waitCard('✅', 'Fatto!', 'Aspetta le altre…');
-    const cur = q[i], ans = my[i];
-    return `<div class="card"><div class="qdots">${q.map((_, k) => `<i class="${my[k] ? (my[k].ok ? 'ok' : 'ko') : k === i ? 'cur' : ''}"></i>`).join('')}</div><h2 class="qq">${esc(cur.q)}</h2>
-      <div class="opts">${cur.opts.map((o, k) => `<button class="opt ${ans ? (ans.c === k ? (ans.ok ? 'ok' : 'ko') : '') : (fb && fb.c === k ? 'sel' : '')}" data-act="ans" data-q="${i}" data-c="${k}" ${ans ? 'disabled' : ''}>${esc(o)}</button>`).join('')}</div>${timerBar()}</div>`;
+  setInterval(() => { document.querySelectorAll('.cd').forEach((el) => { el.textContent = fmtLeft(Number(el.dataset.end) - Date.now()); }); }, 1000);
+  const heatTxt = () => { const H = D.HEAT[S.heat || 2]; return S.status === 'playing' && H ? ` · ${H.icon} ${H.name}` : ''; };
+  function headerHTML(m) {
+    const cur = S.status === 'playing' ? P(S.turn) : null;
+    let bar = '';
+    const round = S.settings.maxRounds ? ` · giro ${Math.min(S.round + 1, S.settings.maxRounds)}/${S.settings.maxRounds}` : '';
+    if (cur) bar = S.turn === S.you ? `<div class="turnbar me">⭐ Tocca a te!${round}</div>` : `<div class="turnbar">Tocca a ${cur.emoji} ${esc(cur.name)}${round}</div>`;
+    const d = delta && Date.now() < delta.until ? `<span class="delta ${delta.v > 0 ? 'up' : 'down'}">${delta.v > 0 ? '+' : '−'}${Math.abs(delta.v)}</span>` : '';
+    return `<header><div class="hrow"><div class="av" style="--c:${m.color}">${m.emoji}</div>
+      <div><div class="hname">${esc(m.name)}</div><div class="hsub">${m.bankrupt ? 'fuori dal gioco' : m.inJail ? '🚔 in prigione' : nm(m.pos)}${S.settings.winWorth && S.myWorth != null ? ' · 💎 ' + S.myWorth + '/' + S.settings.winWorth : ''}${S.late ? ' · 🔥 fase finale' : ''}${heatTxt()}</div></div>
+      <button class="hq" data-act="help">?</button>
+      <div class="hbadges">${m.shield ? '🛡️' : ''}${m.x2 ? '✖️2' : ''}${m.skip ? '⏭️' : ''}</div>
+      <div class="hcash">${m.cash !== null ? eur(m.cash) : ''}${d}</div></div>${bar}${extraBar(m)}</header>`;
   }
-  // numeri casuali ripetibili (stessa sequenza per tutte)
-  const rng = (seed) => { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let r = Math.imul(a ^ (a >>> 15), 1 | a); r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r; return ((r ^ (r >>> 14)) >>> 0) / 4294967296; }; };
-  const CANDLE = ['#e2b559', '#c2453d', '#4a7ad1', '#3d9a6b'];
-  function startMini() {
-    const M = S.mission;
-    if (mini && mini.seq === M.seq) return;
-    const r = rng(M.seed);
-    mini = { seq: M.seq, type: M.type, r, submitted: false, startedAt: Date.now() };
-    if (M.type === 'memory') { mini.pat = Array.from({ length: 12 }, () => Math.floor(r() * 4)); mini.level = 1; mini.state = 'intro'; mini.pos = 0; mini.lit = -1; }
-    if (M.type === 'intruder') { mini.found = 0; mini.lock = 0; mini.round = null; mini.endsAt = Date.now() + D.MISSIONS.intruder.sec * 1000; newGrid(); }
+
+  function deedMini(idx) {
+    const sq = BOARD[idx];
+    const col = colorOf(idx);
+    let rows = '';
+    if (sq.type === 'street') rows = `<div class="db"><span>Affitto</span><b>${eur(sq.rent[0])}</b></div><div class="db"><span>Con tutto il colore</span><b>${eur(sq.rent[0] * 2)}</b></div><div class="db"><span>Una casa</span><b>${eur(sq.rent[1])}</b></div><div class="db"><span>Albergo</span><b>${eur(sq.rent[5])}</b></div><div class="db"><span>🗽 Monumento</span><b>${eur(Math.round(sq.rent[5] * 1.6 / 10) * 10)}</b></div>`;
+    else if (sq.type === 'station') rows = '<div class="db"><span>Affitto</span><b>€25 – €200</b></div>';
+    else rows = '<div class="db"><span>Affitto</span><b>4× o 10× dadi</b></div>';
+    return `<div class="deed"><div class="dh" style="background:${col};color:${textOn(col)}">${esc(nm(idx))}</div>
+      <div class="db"><span>Prezzo</span><b>${eur(S.buy && S.buy.idx === idx ? S.buy.price : sq.price)}</b></div>${rows}</div>`;
   }
-  // --- le candele ---
-  function memoryHTML() {
-    startMini();
-    if (mini.state === 'intro') { mini.state = 'wait'; setTimeout(() => memShow(), 900); }
-    const status = mini.state === 'show' ? 'Guarda…' : mini.state === 'input' ? 'Tocca a te!' : mini.state === 'fail' ? 'Sbagliato!' : 'Preparati…';
-    return `<div class="card center"><div class="lvl">Livello ${Math.min(5, mini.level)} / 5</div><div class="status">${status}</div>
-      <div class="candles">${CANDLE.map((c, i) => `<button class="cdl ${mini.lit === i ? 'lit' : ''}" style="--c:${c}" data-act="cdl" data-i="${i}" ${mini.state === 'input' ? '' : 'disabled'}><span>🕯️</span></button>`).join('')}</div>${timerBar()}</div>`;
+
+  function logHTML(n) {
+    return `<div class="log">${S.log.slice(-n).map((l) => `<div>${esc(l.text)}</div>`).join('')}</div>`;
   }
-  async function memShow() {
-    if (!mini || mini.type !== 'memory' || mini.submitted) return;
-    mini.state = 'show'; mini.pos = 0; render();
-    const len = mini.level + 1;
-    for (let i = 0; i < len; i++) {
-      await new Promise((r) => setTimeout(r, 450));
-      if (!mini || mini.submitted) return;
-      mini.lit = mini.pat[i]; render();
-      await new Promise((r) => setTimeout(r, 520));
-      mini.lit = -1; render();
+
+  function acesHTML(m, usable) {
+    if (!S.settings.aces) return '';
+    const hand = S.aces || [];
+    if (!hand.length) return '<div class="card acehand"><h3>🃏 Assi nella manica</h3><p class="muted">Non ne hai. Passando dalla Partenza ne puoi guadagnare uno.</p></div>';
+    const cards = hand.map((k) => {
+      const A = D.ACES[k];
+      const off = !usable || ((k === 'swap' || k === 'warp') && S.phase !== 'roll') || (k === 'shield' && m.shield) || (k === 'x2' && m.x2) || ((k === 'swap' || k === 'warp') && m.inJail);
+      return `<button class="ace ${off ? 'off' : ''}" data-act="ace" data-k="${k}"><span class="ai">${A.icon}</span><b>${A.name}</b><small>${A.desc}</small></button>`;
+    }).join('');
+    return `<div class="card acehand"><h3>🃏 Assi nella manica</h3><div class="aces">${cards}</div>${usable ? '' : '<p class="muted">Si giocano nel tuo turno.</p>'}</div>`;
+  }
+  function cheatHTML(mine) {
+    const c = S.cheat;
+    if (!c) return '';
+    if (mine) {
+      if (c.pending) return '<p class="muted">🕵️ Hai barato… speriamo che nessuna se ne accorga!</p>';
+      if (c.canCheat) return '<button class="btn sm ghost" data-act="cheat" style="margin-top:10px">🕵️ Fai il furbo (+€100 di nascosto, prima di tirare)</button>';
+      return '';
     }
-    await new Promise((r) => setTimeout(r, 250));
-    if (mini && !mini.submitted) { mini.state = 'input'; mini.pos = 0; render(); }
+    if (c.canAccuse) return '<button class="btn gold" data-act="accuse">🔎 Accusa di aver barato</button><p class="muted">Giusta: lei paga €200 a te. Sbagliata: paghi €50 tu.</p>';
+    return '';
   }
-  function memTap(i) {
-    if (!mini || mini.state !== 'input') return;
-    mini.lit = i; render(); setTimeout(() => { if (mini) { mini.lit = -1; render(); } }, 160);
-    if (mini.pat[mini.pos] !== i) { mini.state = 'fail'; render(); setTimeout(() => submitMini(mini.level - 1), 900); return; }
-    mini.pos++;
-    if (mini.pos >= mini.level + 1) {
-      if (mini.level >= 5) { submitMini(5); return; }
-      mini.level++; mini.state = 'wait'; render(); setTimeout(memShow, 700);
+  function pickerHTML(m) {
+    const A = pick.kind === 'tris' ? { icon: '✨', name: 'Tris', target: 'square' } : D.ACES[pick.key];
+    let body = '';
+    if (A.target === 'player') {
+      const others = S.players.filter((p) => !p.bankrupt && p.id !== S.you);
+      body = `<div class="chips">${others.map((p) => `<button class="chip" data-act="acetarget" data-id="${p.id}">${p.emoji} ${esc(p.name)}${p.shield ? ' 🛡️' : ''}</button>`).join('')}</div>`;
+    } else {
+      body = `<div class="sqgrid">${BOARD.map((sq, i) => (i === m.pos ? '' : `<button class="chip sqb" data-act="${pick.kind === 'tris' ? 'warpTo' : 'acesq'}" data-i="${i}"><i style="background:${colorOf(i)}"></i>${esc(nm(i))}</button>`)).join('')}</div>`;
     }
-  }
-  // --- l'intruso ---
-  const PAIRS = [['🌹', '🥀'], ['🕯️', '🔦'], ['🦇', '🦉'], ['🔔', '🛎️'], ['🗝️', '🔑'], ['🌙', '🌛'], ['⚜️', '🔱'], ['📜', '📃'], ['🕊️', '🐦'], ['🍇', '🫐']];
-  function newGrid() {
-    const a = PAIRS[Math.floor(mini.r() * PAIRS.length)];
-    const flip = mini.r() < 0.5;
-    mini.round = { main: flip ? a[0] : a[1], odd: flip ? a[1] : a[0], at: Math.floor(mini.r() * 16) };
-  }
-  function intruderHTML() {
-    startMini();
-    const r = mini.round;
-    const left = Math.max(0, mini.endsAt - Date.now());
-    return `<div class="card center"><div class="lvl">Trovati: <b id="found">${mini.found}</b> · <span id="itm">${fmt(left)}</span></div><div class="grid16">${Array.from({ length: 16 }, (_, i) => `<button class="gc ${mini.lock > Date.now() ? 'lock' : ''}" data-act="gc" data-i="${i}">${i === r.at ? r.odd : r.main}</button>`).join('')}</div><p class="muted">Tocca il simbolo diverso dagli altri.</p></div>`;
-  }
-  function gcTap(i) {
-    if (!mini || mini.type !== 'intruder' || mini.submitted || mini.lock > Date.now()) return;
-    if (i === mini.round.at) { mini.found++; newGrid(); } else mini.lock = Date.now() + 1200;
-    render();
-    if (mini.lock > Date.now()) setTimeout(render, 1250);
-  }
-  async function submitMini(score) {
-    if (!mini || mini.submitted) return;
-    mini.submitted = true;
-    await act({ type: 'mSubmit', score });
-  }
-  // fine tempo dei mini-giochi (client)
-  setInterval(() => {
-    if (!S || S.phase !== 'mission' || !mini || mini.submitted || (S.me && S.me.narrator)) return;
-    if (mini.type === 'intruder' && Date.now() >= mini.endsAt) submitMini(mini.found);
-    if (mini.type === 'memory' && endAt && Date.now() >= endAt - 2500) submitMini(mini.state === 'fail' ? mini.level - 1 : mini.level - 1);
-    const f = $('#found'), t = $('#itm'); if (f && mini.type === 'intruder') { f.textContent = mini.found; t.textContent = fmt(mini.endsAt - Date.now()); }
-  }, 500);
-
-  function renderMissionEnd() {
-    const r = S.missionRes; const mm = S.me;
-    if (mm.narrator) return `<div class="wrap">${waitCard('🏆', 'Risultati', 'Guarda il tabellone.')}${narrPanel()}</div>`;
-    const my = r.ranking.find((x) => x.id === S.you);
-    return `<div class="wrap">${waitCard(D.MISSIONS[r.type].icon, 'Missione conclusa', `Il premio cresce di <b>€${r.add}</b>.${r.sabotaged ? '<br>🗡️ Qualcosa è andato storto…' : ''}`)}
-      ${r.myShield ? '<div class="card shieldc"><div class="bigi">🛡️</div><h3>Hai vinto uno scudo!</h3><p>Una volta, ti salva dall\'eliminazione notturna. Nessuna sa che ce l\'hai: <b>non dirlo a nessuno</b>.</p></div>' : ''}
-      ${my ? `<p class="muted center">Il tuo punteggio: <b>${my.pts}</b></p>` : ''}${!mm.alive ? ghostBox() : ''}</div>`;
+    return `<div class="card"><h3>${A.icon} ${A.name}: ${A.target === 'player' ? 'scegli chi' : 'scegli dove andare'}</h3>${body}${pick.kind === 'tris' ? '' : '<button class="btn ghost" data-act="cancelPick">Annulla</button>'}</div>`;
   }
 
-  // ---------- tavola e voto ----------
-  function renderTable() {
-    const mm = S.me; const m = me();
-    if (mm.narrator) return `<div class="wrap">${waitCard('🗣️', 'Tavola rotonda', `${S.table.ready.length}/${S.alive} pronte a votare`)}${narrPanel()}</div>`;
-    const isReady = S.table.ready.includes(S.you);
-    return `<div class="wrap">${waitCard('🗣️', 'Tavola rotonda', 'Parlate! Chi è la Traditrice? Accusate, difendetevi, mentite.')}
-      ${mm.alive ? (isReady ? '<div class="card center"><p>✅ Sei pronta a votare. Aspetta le altre.</p></div>' : '<button class="btn big" data-act="tready">🗳️ Sono pronta a votare</button>') : ghostBox()}
-      <div class="card"><h3>Ancora in gioco (${S.alive})</h3>${S.players.filter((p) => !p.narrator && p.alive).map((p) => `<div class="prow">${seal(p.seal, 34)}<b>${esc(p.name)}</b>${S.table.ready.includes(p.id) ? ' ✅' : ''}</div>`).join('')}</div></div>`;
+  function autoHTML() {
+    if (!S.settings.autoEnd) return '<p class="muted">Prima di finire puoi costruire, ipotecare o fare scambi.</p>';
+    if (S.hold) return '<p class="muted">⏸ Turno in pausa: premi il pulsante quando hai finito.</p>';
+    if (S.autoLeft > 0) return `<div class="autobar"><div class="fill" style="animation-duration:${S.autoLeft}ms"></div><span>Il turno passa da solo…</span><button class="btn sm ghost" data-act="hold">⏸ Aspetta</button></div>`;
+    return '<p class="muted">Prima di finire puoi costruire, ipotecare o fare scambi.</p>';
   }
-  function renderVote() {
-    const mm = S.me; const v = S.vote;
-    if (mm.narrator) return `<div class="wrap">${waitCard('🗳️', 'Si vota', `${v.done.length}/${S.alive} hanno votato`)}${narrPanel()}</div>`;
-    if (!mm.alive) return `<div class="wrap">${waitCard('🗳️', 'Si vota', `${v.done.length}/${S.alive} hanno votato`)}${ghostBox()}</div>`;
-    const cands = S.players.filter((p) => !p.narrator && p.alive && p.id !== S.you && (!v.cands || v.cands.includes(p.id)));
-    const sel = voteSel || v.mine;
-    return `<div class="wrap"><div class="card"><h2>${v.revote ? '⚖️ Pareggio: rivota' : '🗳️ Chi bandisci?'}</h2><p class="muted">Il tuo voto sarà pubblico quando si scopriranno i voti sul tabellone.</p>
-      ${seals(cands, '', sel)}<button class="btn big wine" data-act="voteGo" ${sel ? '' : 'disabled'}>${v.mine ? 'Cambia voto' : 'Conferma il voto'}</button>${v.mine ? `<p class="muted">✅ Hai votato <b>${esc(P(v.mine).name)}</b>. (${v.done.length}/${S.alive})</p>` : ''}${timerBar()}</div></div>`;
+  function auctionOwnHTML() {
+    const mine = propsOf(S.you).filter((i) => !S.props[i].mortgaged && !S.props[i].houses);
+    if (!mine.length) return '';
+    return `<p class="muted" style="margin-top:10px">🔨 Oppure metti all'asta una tua proprietà: se qualcuna la compra ti rientra il 70%.</p><div class="row" style="flex-wrap:wrap">${mine.map((i) => `<button class="btn ghost" data-act="auctionOwn" data-i="${i}">${esc(nm(i))}</button>`).join('')}</div>`;
   }
-  function renderBanish() {
-    if (S.me.narrator) return `<div class="wrap">${waitCard('⚖️', 'Il verdetto', 'Guarda il tabellone.')}${narrPanel()}</div>`;
-    return `<div class="wrap">${waitCard('⚖️', 'Il verdetto', 'Guarda il tabellone: si scoprono i voti uno alla volta…')}${!S.me.alive ? ghostBox() : ''}</div>`;
-  }
-  function renderEnded() {
-    const mm = S.me; const w = S.winner === 'faithful';
-    const won = mm && mm.role && ((w && mm.role === 'faithful') || (!w && mm.role === 'traitor'));
-    return `<div class="wrap"><div class="card center ${w ? 'fa' : 'tr'}"><div class="bigi">${w ? '🕊️' : '🗡️'}</div><h2>${w ? 'Hanno vinto le Fedeli!' : 'Hanno vinto le Traditrici!'}</h2>
-      ${mm && mm.role ? `<p class="resline">${won ? '🎉 Hai vinto!' : '😈 Peccato, stavolta no.'}</p>` : ''}<p>Premio: <b>€${S.prize}</b> a testa per chi ha vinto ed era ancora in gioco.</p></div>
-      <div class="card"><h3>Chi era chi</h3>${S.players.filter((p) => !p.narrator).map((p) => `<div class="prow">${seal(p.seal, 36, { dead: !p.alive })}<b>${esc(p.name)}</b><span class="rb ${p.role}">${p.role === 'traitor' ? '🗡️ Traditrice' : '🕊️ Fedele'}</span>${p.alive ? '' : ' 💀'}</div>`).join('')}</div>
-      <button class="btn ghost" data-act="help">❓ Regole</button></div>`;
+  function bankerHTML(m) {
+    if (!S.settings.banker || !S.bankerId) return '';
+    const b = P(S.bankerId);
+    if (S.bankerId === S.you) {
+      let h = '<div class="card bankcard"><h3>🏦 Sei il banchiere</h3>';
+      if (!S.payouts.length) h += '<p class="muted">Quando la banca deve pagare qualcuno (Partenza, carte), comparirà qui. Quello che non dai lo tieni tu, di nascosto… ma se ti accusano giusto restituisci il doppio.</p>';
+      for (const x of S.payouts) {
+        const q = P(x.pid);
+        h += `<div class="payrow"><p><b>Paga ${q.emoji} ${esc(q.name)}</b>: ${eur(x.amount)} <span class="muted">(${esc(x.reason)})</span></p>
+          <div class="row">${[[100, 'Tutto'], [75, '¾'], [50, 'Metà'], [0, 'Niente']].map(([pc, lb]) => `<button class="btn sm ${pc === 100 ? 'green' : 'ghost'}" data-act="payBanker" data-id="${x.id}" data-pct="${pc}">${lb}<br><small>${eur(Math.floor(x.amount * pc / 100))}</small></button>`).join('')}</div></div>`;
+      }
+      return h + '</div>';
+    }
+    let h = '';
+    if (S.incoming.length) h += `<div class="evbox" style="background:linear-gradient(90deg,#1c7a4f,#27a56a)">💰 Il banchiere ti deve pagare ${eur(S.incoming.reduce((n, x) => n + x.amount, 0))}</div>`;
+    if (S.canAccuseBanker) h += `<div class="card bankcard" style="padding:10px"><p class="muted" style="margin:0 0 6px">🏦 Il banchiere è ${b.emoji} ${esc(b.name)}. Ti ha dato meno del dovuto?</p><button class="btn sm gold" data-act="accuseBanker">🔎 Accusa il banchiere</button></div>`;
+    return h;
   }
 
-  // ---------- disegno ----------
-  let lastFx = '';
+  function panelTurn(m) {
+    if (m.bankrupt) return '<div class="card"><h3>Sei fuori dal gioco 😢</h3><p class="muted">Puoi guardare il resto della partita sul tabellone.</p></div>';
+    const myTurn = S.turn === S.you;
+    const cur = P(S.turn);
+    const sqCur = BOARD[cur.pos];
+    let html = bankerHTML(m) + eventHTML();
+    if (myTurn && S.phase === 'choose' && S.choice && S.choice.kind === 'tris') pick = { kind: 'tris' };
+    if (pick && myTurn && ['roll', 'action', 'choose'].includes(S.phase)) return html + pickerHTML(m);
+    pick = null;
+    const myDebts = S.debts.filter((d) => d.pid === S.you);
+
+    if (myDebts.length) {
+      const total = myDebts.reduce((n, d) => n + d.amount, 0);
+      html += `<div class="card"><h3>💸 Devi pagare ${eur(total)}</h3>
+        ${myDebts.map((d) => `<p>${eur(d.amount)} a ${d.creditor === 'bank' || d.creditor === 'pot' ? 'la banca' : esc(P(d.creditor).name)} <span class="muted">(${esc(d.reason)})</span></p>`).join('')}
+        <p class="muted">Hai ${eur(m.cash)}. Raccogli i soldi: ipoteca proprietà, vendi case o proponi uno scambio. Appena ne hai abbastanza, si paga da solo.</p>
+        <div class="row"><button class="btn ghost" data-tab="props">🏠 Proprietà</button><button class="btn ghost" data-tab="scambi">🤝 Scambi</button></div>
+        ${S.phase === 'debt' ? auctionOwnHTML() : ''}
+        <button class="btn red" data-act="bankrupt">Dichiaro bancarotta</button></div>`;
+      return html + logHTML(3);
+    }
+
+    if (S.phase === 'auction' && S.auction) {
+      const a = S.auction;
+      const active = a.active.includes(S.you);
+      const sq = BOARD[a.idx];
+      const bidder = a.bidder ? P(a.bidder) : null;
+      html += `<div class="card"><h3>🔨 Asta: ${esc(nm(a.idx))}</h3>${deedMini(a.idx)}
+        <div class="bigtxt">${eur(a.high)}</div>
+        <p class="muted" style="text-align:center">${bidder ? `${bidder.emoji} ${esc(bidder.name)} è in testa` : 'Nessuna offerta ancora'}</p>`;
+      if (active) {
+        const can = (inc) => a.bidder !== S.you && a.high + inc <= m.cash;
+        html += `<div class="row">${a.minBid && a.high === 0 ? [0, 10, 50].map((inc) => `<button class="btn ${a.bidder !== S.you && a.minBid + inc <= m.cash ? '' : 'off'}" data-act="bid" data-amt="${a.minBid + inc}">${eur(a.minBid + inc)}</button>`).join('') : [10, 50, 100].map((inc) => `<button class="btn ${can(inc) ? '' : 'off'}" data-act="bid" data-amt="${a.high + inc}">+${inc}</button>`).join('')}</div>
+          <button class="btn ghost" data-act="pass">Mi ritiro</button>`;
+      } else html += '<p class="muted" style="text-align:center">Ti sei ritirato dall\'asta.</p>';
+      return html + '</div>' + logHTML(3);
+    }
+
+    if (S.phase === 'sale' && S.sale) {
+      const sl = S.sale, seller = P(sl.from), to = P(sl.to);
+      html += `<div class="card"><h3>🤝 Offerta diretta</h3>${deedMini(sl.idx)}
+        <p class="bigtxt">${eur(sl.price)}</p>`;
+      if (sl.to === S.you) html += `<p style="text-align:center"><b>${seller.emoji} ${esc(seller.name)}</b> ti offre <b>${esc(nm(sl.idx))}</b> per ${eur(sl.price)}. Ti conviene?</p>
+        <div class="row"><button class="btn green ${m.cash >= sl.price ? '' : 'off'}" data-act="${m.cash >= sl.price ? 'saleAccept' : 'why'}" data-w="Non hai abbastanza soldi">✅ Accetto</button><button class="btn ghost" data-act="saleDecline">❌ No grazie</button></div>`;
+      else if (sl.from === S.you) html += `<p class="muted" style="text-align:center">Aspetta la risposta di ${to.emoji} ${esc(to.name)}…</p><button class="btn ghost" data-act="saleCancel">Ritira l'offerta</button>`;
+      else html += `<p class="muted" style="text-align:center">${seller.emoji} ${esc(seller.name)} offre la proprietà a ${to.emoji} ${esc(to.name)}.</p>`;
+      return html + '</div>' + logHTML(3);
+    }
+
+    if (S.phase === 'claim' && S.claim) {
+      const c = S.claim, from = P(c.from);
+      html += `<div class="card"><h3>🙋 Chi la vuole?</h3>${deedMini(c.idx)}<p class="bigtxt">${eur(c.price)}</p>`;
+      if (c.from === S.you) html += `<p class="muted" style="text-align:center">Hai lasciato libera <b>${esc(nm(c.idx))}</b>. Se qualcuna la prende, ti spetta il 10% (${eur(Math.round(c.price * 0.1 / 10) * 10)}).</p>`;
+      else if ((c.claimed || []).includes(S.you)) html += `<p style="text-align:center">🙋 Hai detto che la vuoi! Se anche qualcun'altra la vuole, parte un'<b>asta</b> tra voi.</p>${(c.claimed || []).length > 1 ? `<p class="muted" style="text-align:center">La vogliono: ${(c.claimed || []).map((id) => esc(P(id).name)).join(', ')}</p>` : ''}`;
+      else if (c.eligible.includes(S.you) && !c.passed.includes(S.you)) html += `<p style="text-align:center">${from.emoji} ${esc(from.name)} non l'ha voluta. Prezzo di listino: la prendi tu? (Se la vogliono in due, si fa l'asta)</p>
+        <div class="row"><button class="btn green" data-act="claimTake">🙋 La voglio!</button><button class="btn ghost" data-act="claimPass">No grazie</button></div>`;
+      else html += '<p class="muted" style="text-align:center">Stai guardando: aspetta che decidano le altre.</p>';
+      return html + '</div>' + logHTML(3);
+    }
+
+    if (S.phase === 'dare' && S.dare) {
+      const dp = P(S.dare.pid);
+      const dw = S.dare.win || 100, dl = S.dare.lose || 50;
+      html += `<div class="card"><h3>${S.dare.lampo ? '⚡ Sfida lampo!' : '🎭 Sfida!'}</h3><p class="bigtxt" style="font-size:20px">${dp.emoji} ${esc(dp.name)} ${esc(S.dare.text)}</p>`;
+      if (S.dare.pid === S.you) html += `<div class="row"><button class="btn green" data-act="dareYes">✅ Fatto +€${dw}</button><button class="btn ghost" data-act="dareNo">🙈 Passo −€${dl}</button></div>`;
+      else html += `<p class="muted" style="text-align:center">Guardate bene: se ${esc(dp.name)} lo fa davvero, prende €${dw}!</p>`;
+      return html + '</div>' + logHTML(3);
+    }
+
+    if (S.phase === 'debt') {
+      const d = S.debts[0];
+      return `<div class="card"><h3>⏳ Aspetta…</h3><p>${P(d.pid).emoji} ${esc(P(d.pid).name)} deve raccogliere ${eur(d.amount)}.</p></div>` + logHTML(3);
+    }
+
+    if (!myTurn) {
+      html += `<div class="card"><h3>Tocca a ${cur.emoji} ${esc(cur.name)}</h3>${diceHTML(S.dice)}`;
+      if (S.phase === 'choose') html += '<p class="muted">Sta scegliendo come muoversi.</p>';
+      else if (S.phase === 'buy') html += `<p class="muted">Sta decidendo se comprare <b>${esc(nm(cur.pos))}</b> (${eur(S.buy ? S.buy.price : sqCur.price)}).</p>`;
+      else if (S.phase === 'roll') html += '<p class="muted">Sta per tirare i dadi.</p>';
+      else html += '<p class="muted">Sta decidendo cosa fare.</p>';
+      html += `<p class="muted">Nel frattempo puoi sistemare le tue proprietà o proporre scambi.</p>${cheatHTML(false)}</div>`;
+      html += acesHTML(m, false);
+      return html + logHTML(4);
+    }
+
+    // ---- è il mio turno ----
+    if (S.phase === 'roll') {
+      html += '<div class="card">';
+      if (m.inJail) {
+        html += `<h3>🚔 Sei in prigione</h3><p class="muted">Prova a fare doppio, oppure esci subito.</p>
+          <div class="row"><button class="btn ${m.cash >= 50 ? 'gold' : 'off'}" data-act="payJail">Paga €50</button>
+          ${S.jailCardsMine ? '<button class="btn green" data-act="useJailCard">Usa la carta</button>' : ''}</div>`;
+      } else if (S.doubles) html += '<h3>Doppio! 🎉</h3><p class="muted">Tira ancora.</p>';
+      html += `<button class="btn green huge" data-act="roll">🎲 ${m.inJail ? 'Tira (doppio = libera)' : 'Tira i dadi'}</button>${cheatHTML(true)}</div>`;
+      html += acesHTML(m, true);
+      return html + logHTML(3);
+    }
+    if (S.phase === 'choose' && S.choice) {
+      const c = S.choice;
+      html += `<div class="card"><h3>🚌 Navetta!</h3>${diceHTML(S.dice)}<p class="muted">Di quanto vuoi muoverti?</p>
+        <div class="row"><button class="btn green" data-act="busPick" data-p="d1">${c.d1}</button><button class="btn green" data-act="busPick" data-p="d2">${c.d2}</button><button class="btn gold" data-act="busPick" data-p="sum">${c.d1 + c.d2}</button></div></div>`;
+      return html + logHTML(3);
+    }
+    if (S.phase === 'buy' && salePick) {
+      const idx = S.buy.idx;
+      const others = S.players.filter((p) => !p.bankrupt && p.id !== S.you);
+      html += `<div class="card"><h3>🤝 Offri ${esc(nm(idx))} a una giocatrice</h3>
+        <p class="muted">Scegli a chi e a che prezzo. Se accetta, la proprietà è sua e i soldi li prendi tu. Se rifiuta, torni a decidere.</p>
+        <div class="chips">${others.map((p) => `<button class="chip ${salePick.to === p.id ? 'on' : ''}" data-act="saleTo" data-id="${p.id}">${p.emoji} ${esc(p.name)}</button>`).join('')}</div>
+        <div class="bigtxt">${eur(salePick.price)}</div>
+        <div class="row">${[-50, -10, 10, 50].map((d) => `<button class="btn ghost sm" data-act="salePrice" data-d="${d}">${d > 0 ? '+' : ''}${d}</button>`).join('')}</div>
+        <button class="btn green ${salePick.to ? '' : 'off'}" data-act="${salePick.to ? 'saleSend' : 'why'}" data-w="Scegli prima a chi offrirla">Invia l'offerta</button>
+        <button class="btn ghost" data-act="saleClose">Annulla</button></div>`;
+      return html + logHTML(3);
+    }
+    if (S.phase === 'buy') {
+      const idx = S.buy.idx;
+      const can = m.cash >= S.buy.price;
+      html += `<div class="card"><h3>Sei su ${esc(nm(idx))}</h3>${diceHTML(S.dice)}${deedMini(idx)}
+        <button class="btn green ${can ? '' : 'off'}" data-act="buy">Compra per ${eur(S.buy.price)}</button>
+        <button class="btn ghost" data-act="decline">${S.settings.freeBuy ? 'Non comprare (la lascio libera)' : S.settings.auctions ? 'Non comprare (asta)' : 'Non comprare'}</button>
+        <button class="btn ghost" data-act="saleOpen">🤝 Offri a una giocatrice</button>
+        ${can ? '' : '<p class="muted">Non hai abbastanza soldi: puoi ipotecare qualcosa nel tab Proprietà.</p>'}</div>`;
+      return html + logHTML(3);
+    }
+    if (S.phase === 'action') {
+      const again = S.canRollAgain && !m.inJail;
+      html += `<div class="card"><h3>${again ? 'Doppio! 🎉' : 'Il tuo turno'}</h3>
+        ${diceHTML(S.dice)}
+        ${autoHTML()}
+        ${S.travel && S.travel.length ? `<p class="muted" style="margin:6px 0 2px">🚆 Sei su una tua stazione: puoi viaggiare gratis</p><div class="row" style="flex-wrap:wrap">${S.travel.map((i) => `<button class="btn ghost" data-act="travel" data-i="${i}">🚆 ${esc(nm(i))}</button>`).join('')}</div>` : ''}
+        <button class="btn ${again ? 'green' : 'gold'}" data-act="endTurn">${again ? '🎲 Tira ancora' : 'Fine turno'}</button>${cheatHTML(true)}</div>`;
+      html += acesHTML(m, true);
+      return html + logHTML(4);
+    }
+    return logHTML(3);
+  }
+
+  function panelProps(m) {
+    const mine = propsOf(S.you);
+    if (!mine.length) return '<div class="card"><h3>Non hai ancora proprietà</h3><p class="muted">Quando compri qualcosa, lo gestisci da qui: costruire case, ipotecare.</p></div>';
+    const perms = S.perms || {};
+    const out = [`<div class="sec">Case in banca: ${S.housesLeft} · Alberghi: ${S.hotelsLeft}${m.jailCards ? ` · 🎫 ${m.jailCards}` : ''}</div>`];
+    for (const i of mine) {
+      const sq = BOARD[i], pr = S.props[i], pm = perms[i] || {};
+      const full = sq.type === 'street' && ownsAll(S.you, sq.group);
+      const hs = sq.type === 'street' && pr.houses ? `<span class="hs">${pr.houses === 6 ? '🗽' : pr.houses === 5 ? '<i class="hotel"></i>' : '<i></i>'.repeat(pr.houses)}</span>` : '';
+      const why = pm.why || {};
+      const B = (act, cls, label, ok) => `<button class="btn sm ${cls} ${ok ? '' : 'off'}" data-act="${ok ? act : 'why'}" data-i="${i}" data-w="${esc(why[act] || '')}">${label}</button>`;
+      let btns = '';
+      if (sq.type === 'street' && full) {
+        btns += B('build', pr.houses === 5 ? 'gold' : 'green', `${pr.houses === 5 ? '🗽 Monumento' : pr.houses === 4 ? '🏨 Albergo' : '🏠 Casa'} −${pr.houses >= 5 ? sq.houseCost * 2 : sq.houseCost}`, pm.build);
+        if (pr.houses > 0) btns += B('sell', 'ghost', `Vendi +${Math.floor((pr.houses > 5 ? sq.houseCost * 2 : sq.houseCost) / 2)}`, pm.sell);
+      }
+      if (!pr.mortgaged) btns += B('mortgage', 'ghost', `Ipoteca +${sq.price / 2}`, pm.mortgage);
+      else btns += B('unmortgage', 'gold', `Riscatta −${Math.ceil(sq.price * 0.55)}`, pm.unmortgage);
+      out.push(`<div class="prop${pr.mortgaged ? ' mort' : ''}"><div class="bar" style="background:${colorOf(i)}"></div><div class="pc">
+        <div class="pn"><span>${esc(nm(i))}</span>${hs}</div>
+        <div class="ps">${pr.mortgaged ? '<span class="tag red">IPOTECATA</span>' : `Affitto ora: <b>${rentNow(i)}</b>`} ${full ? '<span class="tag gold">★ colore completo</span>' : ''}</div>
+        <div class="pb">${btns}</div></div></div>`);
+    }
+    return out.join('');
+  }
+
+  function propChips(list, side, selected, theirs) {
+    if (!list.length) return '<span class="muted">nessuna proprietà</span>';
+    return `<div class="chips">${list.map((i) => `<button class="chip ${selected.includes(i) ? 'on' : ''} ${tradable(i) ? '' : 'dis'}" data-act="tprop" data-side="${side}" data-i="${i}">${esc(nm(i))}${S.props[i].mortgaged ? ' 🔒' : ''}</button>`).join('')}</div>`;
+  }
+
+  function stepper(side, val, max) {
+    return `<div class="stepper"><button data-act="tcash" data-side="${side}" data-d="-50">−50</button><button data-act="tcash" data-side="${side}" data-d="-10">−10</button>
+      <b>${eur(val)}</b><button data-act="tcash" data-side="${side}" data-d="10">+10</button><button data-act="tcash" data-side="${side}" data-d="50">+50</button><button data-act="tcash" data-side="${side}" data-d="100">+100</button></div>`;
+  }
+
+  function panelTrade(m) {
+    if (m.bankrupt) return '';
+    let html = '';
+    if (draft) {
+      const others = S.players.filter((p) => !p.bankrupt && p.id !== S.you);
+      html += `<div class="card"><h3>Nuovo scambio</h3><p class="muted">Con chi?</p><div class="chips">${others.map((p) => `<button class="chip ${draft.to === p.id ? 'on' : ''}" data-act="tto" data-id="${p.id}">${p.emoji} ${esc(p.name)}</button>`).join('')}</div>`;
+      if (draft.to) {
+        const o = P(draft.to);
+        html += `<div class="tcol"><h4>Tu dai</h4>${stepper('offer', draft.offer.cash)}${propChips(propsOf(S.you), 'offer', draft.offer.props)}
+          ${S.jailCardsMine ? `<div class="chips" style="margin-top:8px"><button class="chip ${draft.offer.jail ? 'on' : ''}" data-act="tjail" data-side="offer">🎫 Carta esci di prigione</button></div>` : ''}</div>
+          <div class="tcol"><h4>Tu ricevi da ${esc(o.name)}</h4>${stepper('request', draft.request.cash)}${propChips(propsOf(o.id), 'request', draft.request.props)}
+          ${o.jailCards ? `<div class="chips" style="margin-top:8px"><button class="chip ${draft.request.jail ? 'on' : ''}" data-act="tjail" data-side="request">🎫 Carta esci di prigione</button></div>` : ''}</div>
+          <button class="btn green" data-act="tsend">Invia la proposta</button>`;
+      }
+      html += '<button class="btn ghost" data-act="tcancelDraft">Annulla</button></div>';
+      return html;
+    }
+    const incoming = S.trades.filter((t) => t.to === S.you);
+    const outgoing = S.trades.filter((t) => t.from === S.you);
+    html += '<button class="btn gold" data-act="tnew">🤝 Nuovo scambio</button>';
+    for (const t of incoming) {
+      const f = P(t.from);
+      html += `<div class="card" style="margin-top:12px"><h3>${f.emoji} ${esc(f.name)} ti propone</h3>
+        <p><b>Ti dà:</b> ${esc(sideText(t.offer))}</p><p><b>Vuole:</b> ${esc(sideText(t.request))}</p>
+        <p class="muted">Le proprietà ipotecate costano subito il 10% a chi le riceve.</p>
+        <div class="row"><button class="btn green" data-act="accept" data-id="${t.id}">Accetta</button><button class="btn red" data-act="reject" data-id="${t.id}">Rifiuta</button></div></div>`;
+    }
+    for (const t of outgoing) {
+      const to = P(t.to);
+      html += `<div class="card" style="margin-top:12px"><h3>Proposta a ${to.emoji} ${esc(to.name)}</h3>
+        <p><b>Dai:</b> ${esc(sideText(t.offer))}</p><p><b>Chiedi:</b> ${esc(sideText(t.request))}</p>
+        <button class="btn ghost" data-act="reject" data-id="${t.id}">Annulla proposta</button></div>`;
+    }
+    if (!incoming.length && !outgoing.length) html += '<p class="sub" style="margin-top:20px">Nessuno scambio in corso.<br>Puoi scambiare soldi, proprietà e carte.</p>';
+    return html;
+  }
+
+  function panelPlayers(m) {
+    let html = S.players.map((p) => {
+      const pr = propsOf(p.id);
+      return `<div class="card" style="padding:10px"><div class="hrow" style="color:var(--ink)"><div class="av" style="--c:${p.color}">${p.emoji}</div>
+        <div><div class="hname">${esc(p.name)}${p.id === S.turn && S.status === 'playing' ? ' ⭐' : ''}</div>
+        <div class="hsub" style="color:var(--muted);opacity:1">${p.bankrupt ? '💀 fuori' : p.inJail ? '🚔 in prigione' : nm(p.pos)}${p.connected ? '' : ' · offline'}</div></div>
+        <div class="hcash" style="font-size:20px;color:var(--ink)">${p.cash !== null ? eur(p.cash) : ''}</div></div>
+        <div style="margin-top:6px;display:flex;gap:3px;flex-wrap:wrap">${pr.map((i) => `<span style="width:14px;height:14px;border-radius:3px;background:${colorOf(i)};opacity:${S.props[i].mortgaged ? .35 : 1};border:1px solid rgba(0,0,0,.3)"></span>`).join('')}</div></div>`;
+    }).join('');
+if (S.status === 'playing') { const H = D.HEAT[S.heat || 2]; html = `<div class="card"><h3>${H.icon} Cattiveria: livello ${S.heat || 2} · ${H.name}</h3><p class="muted">${S.settings.meanRise ? 'Sale da sola ogni tanto. ' : ''}Più è alta, più arrivano eventi cattivi e sfide lampo.</p>${(S.heat || 2) < 3 ? '<button class="btn sm gold" data-act="heatUp">🔥 Alza la cattiveria</button>' : '<p class="muted">È già al massimo! 😈</p>'}</div>` + html; }
+    if (S.status === 'playing' && !m.bankrupt) html += '<button class="btn ghost" data-act="resign" style="margin-top:6px">🏳️ Mi arrendo</button>';
+    return html;
+  }
+
+  let modal = null;            // null | 'help' | 'intro'
+  let introFor = null;
+  const openRules = new Set();
+  const FEAT = ['speedDie', 'aces', 'events', 'missions', 'bounty', 'dares', 'cheat', 'freeParking', 'auctions', 'freeBuy'];
+  const ARLAB = (v) => (v ? 'dal giro ' + v : 'subito');
+  const TLAB = { 0: 'senza timer', 30: '30 minuti', 45: '45 minuti', 60: '1 ora', 90: '1 ora e mezza' };
+  const TEAMICON = ['🟥', '🟦', '🟩', '🟨'];
+  const DUR = { 0: 'senza limite', 20: '20 giri', 30: '30 giri', 50: '50 giri' };
+
+  function ruleDetail(k) { return D.RULES[k].long.map((x) => `<p>${x}</p>`).join(''); }
+
+  function renderLobby(m) {
+    const host = S.hostId === S.you;
+    const st = S.settings;
+    const mv = S.myVotes || {};
+    const rows = FEAT.map((k) => {
+      const R = D.RULES[k], t = (S.votes || {})[k] || { yes: 0, no: 0 };
+      const on = !!st[k];
+      return `<div class="vrule"><div class="vt"><span class="vi">${R.icon}</span><div><b>${R.title}</b><small>${R.short}</small></div>
+        <button class="info" data-act="rinfo" data-k="${k}">${openRules.has(k) ? '▲' : 'ℹ︎'}</button></div>
+        ${openRules.has(k) ? `<div class="rdet">${ruleDetail(k)}</div>` : ''}
+        <div class="vb"><button class="vote ${mv[k] ? 'on' : ''}" data-act="vote" data-k="${k}" data-v="1">👍 Sì</button><button class="vote ${mv[k] === false ? 'on no' : ''}" data-act="vote" data-k="${k}" data-v="0">👎 No</button>
+        <span class="vr ${on ? 'yes' : ''}">${t.yes} sì · ${t.no} no → ${on ? '✅ attiva' : '⬜ spenta'}</span></div></div>`;
+    }).join('');
+    return `<div class="wrap"><div class="logo">${esc(D.TITLE)}</div><div class="sub">In attesa di iniziare…</div>
+      <div class="card"><h3>Giocatrici (${S.players.length})</h3>
+      ${S.players.map((p) => `<p style="display:flex;align-items:center;gap:10px"><span class="av" style="--c:${p.color};width:38px;height:38px;font-size:20px">${p.emoji}</span><b>${esc(p.name)}</b>${p.id === S.hostId ? ' ⭐' : ''}${p.id === S.you ? ' <span class="muted">(tu)</span>' : ''}</p>`).join('')}</div>
+      <div class="card"><h3>🗳️ Scegliamo le regole</h3>
+        <p class="muted">Vota quello che vuoi: vince la maggioranza. In caso di pareggio decide ${esc(P(S.hostId).name)} ⭐.</p>
+        <div class="row"><button class="btn sm gold" data-act="vpreset" data-k="ultra">🎉 Voglio tutto (Ultra)</button><button class="btn sm ghost" data-act="vpreset" data-k="classic">📜 Solo classico</button></div>
+        ${rows}</div>
+      ${host ? `<div class="card"><h3>Impostazioni di ${esc(m.name)} ⭐</h3><div class="chips">
+        <button class="chip" data-act="set" data-k="winWorth">🏁 ${st.winWorth ? 'Traguardo ' + eur(st.winWorth) : 'Nessun traguardo'}</button>
+        <button class="chip" data-act="set" data-k="boardSize">🗺️ Tabellone: ${st.boardSize === 40 ? 'classico 40' : 'lungo 60'}</button>
+        <button class="chip" data-act="set" data-k="startCash">💰 Si parte con ${eur(st.startCash)}</button>
+        <button class="chip" data-act="set" data-k="mean">${D.HEAT[st.mean || 2].icon} Cattiveria: ${D.HEAT[st.mean || 2].name}</button>
+        <button class="chip ${st.meanRise ? 'on' : ''}" data-act="set" data-k="meanRise">📈 Sale col tempo</button>
+        <button class="chip" data-act="set" data-k="theme">${esc((D.THEMES[st.theme] || D.THEMES.italia).label)}</button>
+        <button class="chip" data-act="set" data-k="maxRounds">⏱️ Durata: ${DUR[st.maxRounds]}</button>
+        <button class="chip" data-act="set" data-k="auctionRound">🔨 Aste: ${ARLAB(st.auctionRound)}</button>
+        <button class="chip" data-act="set" data-k="timeLimit">⏰ Timer: ${TLAB[st.timeLimit || 0]}</button>
+        <button class="chip ${st.autoEnd ? 'on' : ''}" data-act="set" data-k="autoEnd">⏭️ Fine turno automatico</button>
+        <button class="chip ${st.showCash && !st.cheat ? 'on' : ''}" data-act="set" data-k="showCash">👀 Soldi visibili a tutti</button></div>
+        <button class="btn green ${S.players.length < 2 ? 'off' : ''}" data-act="start">Inizia la partita</button></div>`
+        : `<div class="card"><p class="muted">Aspetta che ${esc(P(S.hostId).name)} avvii la partita (o dal tabellone). Partita: ${(D.THEMES[st.theme] || D.THEMES.italia).label}, cattiveria ${D.HEAT[st.mean || 2].name.toLowerCase()}, ${eur(st.startCash)}, durata ${DUR[st.maxRounds]}, tabellone ${st.boardSize === 40 ? 'classico' : 'lungo'}.</p></div>`}
+      <button class="btn ghost" data-act="help">❓ Come si gioca</button>
+      <button class="btn ghost" data-act="leave">Esci</button></div>`;
+  }
+
+  function activeRulesHTML(detailed) {
+    const st = S.settings;
+    const on = FEAT.filter((k) => st[k]);
+    const off = FEAT.filter((k) => !st[k]);
+    return `${on.length ? on.map((k) => `<div class="rl"><b>${D.RULES[k].icon} ${D.RULES[k].title}</b>${detailed ? ruleDetail(k) : `<p>${D.RULES[k].short}</p>`}</div>`).join('') : '<p class="muted">Si gioca con le regole classiche.</p>'}
+      ${off.length ? `<p class="muted">Spente: ${off.map((k) => D.RULES[k].icon + ' ' + D.RULES[k].title).join(', ')}.</p>` : ''}
+      <p class="muted">${D.THEMES[st.theme] ? D.THEMES[st.theme].label : ''} · si parte con ${eur(st.startCash)} · durata ${DUR[st.maxRounds]}</p>`;
+  }
+  function modalHTML() {
+    if (modal === 'intro') {
+      return `<div class="modal"><div class="mbox"><h2>🎉 Si comincia!</h2><p class="muted">Queste sono le regole di stasera:</p>${activeRulesHTML(true)}
+        <button class="btn green" data-act="closeModal">Ho capito, si gioca!</button></div></div>`;
+    }
+    if (modal === 'help') {
+      return `<div class="modal"><div class="mbox"><h2>❓ Come si gioca</h2>${D.BASICS.map((x) => `<p class="step">${x}</p>`).join('')}${S.size === 60 ? `<h3 style="margin-top:14px">Caselle speciali</h3>${D.SPECIALS.map((x) => `<p class="step">${x}</p>`).join('')}` : ''}
+        <h3 style="margin-top:14px">Regole speciali di questa partita</h3>${S.status === 'lobby' ? '<p class="muted">Si decidono con il voto qui sotto.</p>' + FEAT.map((k) => `<div class="rl"><b>${D.RULES[k].icon} ${D.RULES[k].title}</b>${ruleDetail(k)}</div>`).join('') : activeRulesHTML(true)}
+        <button class="btn ghost" data-act="snd">${pSound ? '🔊 Suoni attivi (tocca per spegnere)' : '🔇 Suoni spenti (tocca per accendere)'}</button><button class="btn gold" data-act="closeModal">Chiudi</button></div></div>`;
+    }
+    return '';
+  }
+
+  function renderEnded(m) {
+    const ws = (S.winners && S.winners.length ? S.winners : [S.winner]).map(P).filter(Boolean);
+    return `<div class="wrap"><div class="logo">🏆</div><div class="sub" style="font-size:24px;color:var(--gold);font-weight:800">${ws.map((w) => w.emoji + ' ' + esc(w.name)).join(' + ')} ${ws.length > 1 ? 'hanno vinto' : 'ha vinto'}!</div>
+      <div class="card"><h3>Classifica finale</h3>${(S.ranking || []).map((r, i) => { const p = P(r.id); return `<p>${i + 1}. ${p.emoji} <b>${esc(p.name)}</b> — ${eur(r.worth)}</p>`; }).join('')}</div>
+      <p class="sub">Per rigiocare: "Menu → Nuova partita" sul tabellone.</p></div>`;
+  }
+
   function render() {
     if (!S) return;
     const app = $('#app');
     const m = me();
-    let html;
-    if (!m) html = renderJoin();
-    else {
-      let body;
-      switch (S.phase) {
-        case 'lobby': body = renderLobby(); break;
-        case 'reveal': body = renderReveal(); break;
-        case 'night': body = renderNight(); break;
-        case 'recruit': body = renderRecruit(); break;
-        case 'dawn': body = renderDawn(); break;
-        case 'mission': body = renderMission(); break;
-        case 'missionEnd': body = renderMissionEnd(); break;
-        case 'table': body = renderTable(); break;
-        case 'vote': body = renderVote(); break;
-        case 'banish': body = renderBanish(); break;
-        case 'ended': body = renderEnded(); break;
-        default: body = '';
-      }
-      html = header() + body;
+    if (!m) { renderJoin(); return; }
+    joinBuilt = false;
+    if (S.status === 'playing' && S.gameId && introFor !== S.gameId) {
+      introFor = S.gameId;
+      let seen = null; try { seen = localStorage.getItem('dv_seen'); } catch (e) { /* */ }
+      if (seen !== S.gameId) modal = 'intro';
     }
-    const active = document.activeElement && document.activeElement.id === 'nm';
-    if (active) return; // non ridisegnare mentre scrive il nome
-    app.innerHTML = html;
-    document.body.classList.toggle('dk', ['night', 'recruit'].includes(S.phase) && !!(m && S.me && !S.me.narrator));
-    if (S.phase === 'ended' && lastFx !== S.gameId) { lastFx = S.gameId; if (S.me && S.me.role && ((S.winner === 'faithful') === (S.me.role === 'faithful'))) confetti(80); }
-    updateTimer();
+    if (S.status === 'lobby') { app.innerHTML = renderLobby(m) + modalHTML(); return; }
+    if (S.status === 'ended') { app.innerHTML = renderEnded(m); return; }
+    const incoming = S.trades.filter((t) => t.to === S.you).length;
+    const body = tab === 'turno' ? panelTurn(m) : tab === 'props' ? panelProps(m) : tab === 'scambi' ? panelTrade(m) : panelPlayers(m);
+    app.innerHTML = headerHTML(m) + `<div class="wrap">${body}</div>
+      <nav>${[['turno', '🎲', 'Turno'], ['props', '🏠', 'Proprietà'], ['scambi', '🤝', 'Scambi'], ['gioc', '👥', 'Giocatori']]
+        .map(([k, ic, lb]) => `<button class="${tab === k ? 'on' : ''}" data-tab="${k}"><span>${ic}</span>${lb}${k === 'scambi' && incoming ? `<i class="bd">${incoming}</i>` : ''}</button>`).join('')}</nav>` + modalHTML();
   }
-  function updateTimer() {
-    const tm = $('#tm'); if (!tm || !S || !S.until) return;
-    const left = S.paused ? S.left : Math.max(0, (endAt || 0) - Date.now());
-    tm.textContent = fmt(left) + (S.paused ? ' ⏸' : '');
-    const bar = $('#bar'); if (bar && S.until) { const tot = Math.max(1, (S.settings.tableSec || 240) * 1000); bar.style.width = Math.min(100, (left / Math.max(left, S.phase === 'table' ? tot : S.phase === 'night' ? 75000 : S.phase === 'vote' ? 60000 : 90000)) * 100) + '%'; }
-  }
-  setInterval(updateTimer, 300);
 
   // ---------- eventi ----------
-  document.addEventListener('input', (e) => { if (e.target.id === 'nm') typedName = e.target.value; });
-  document.addEventListener('change', async (e) => {
-    const c = e.target.closest('[data-act]'); if (!c || !S) return;
-    if (c.dataset.act === 'narr') await act({ type: 'narrator', on: c.checked });
-    if (c.dataset.act === 'rec') { recruitFlag = c.checked; }
-  });
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   document.addEventListener('click', async (e) => {
-    if (!S) return;
-    const tile = e.target.closest('.tile');
-    if (tile && !tile.disabled) {
-      const id = Number(tile.dataset.id);
-      if (S.phase === 'night') nightSel = id; else if (S.phase === 'vote') voteSel = id;
-      render(); return;
+    const tabBtn = e.target.closest('[data-tab]');
+    if (tabBtn) {
+      tab = tabBtn.dataset.tab;
+      if (S && S.status === 'playing' && S.turn === S.you && S.phase === 'action' && !S.hold && (tab === 'props' || tab === 'scambi')) act({ type: 'hold' }); // sto gestendo: niente fine turno automatico
+      render(); window.scrollTo(0, 0); return;
     }
-    const b = e.target.closest('[data-act]'); if (!b || b.type === 'checkbox') return;
-    const a = b.dataset.act, d = b.dataset;
+    const b = e.target.closest('[data-act]');
+    if (!b || !S) return;
+    const a = b.dataset.act;
+    const d = b.dataset;
     switch (a) {
-      case 'pickSeal': selSeal = d.id; render(); break;
+      case 'pick': selEmoji = d.e; render(); return;
       case 'join': {
-        const nm = ($('#nm') ? $('#nm').value : typedName).trim(); typedName = nm;
-        if (!nm) { toast('Scrivi il tuo nome', true); return; }
-        if (!selSeal) { toast('Scegli un sigillo', true); return; }
-        const r = await post('/api/join', { name: nm, seal: selSeal });
+        if (!typedName.trim()) { toast('Scrivi il tuo nome', true); return; }
+        if (!selEmoji) { toast('Scegli una pedina', true); return; }
+        const r = await post('/api/join', { name: typedName, emoji: selEmoji });
         if (!r.ok) { toast(r.error, true); return; }
-        token = r.token; localStorage.setItem('tr_token', token); key = ''; connect(); break;
+        token = r.token; localStorage.setItem('dv_token', token); lastJson = ''; joinBuilt = false; connect();
+        return;
       }
-      case 'claim': { const r = await post('/api/claim', { id: Number(d.id) }); if (!r.ok) { toast(r.error, true); return; } token = r.token; localStorage.setItem('tr_token', token); key = ''; connect(); break; }
-      case 'help': rulesModal(); break;
-      case 'peek': peek = Date.now() + 3000; render(); setTimeout(render, 3050); break;
-      case 'start': await act({ type: 'start' }); break;
-      case 'leave': if (confirm('Uscire dalla partita?')) { await act({ type: 'leave' }); logout(); } break;
+      case 'claim': {
+        const r = await post('/api/claim', { id: d.id });
+        if (!r.ok) { toast(r.error, true); return; }
+        token = r.token; localStorage.setItem('dv_token', token); lastJson = ''; joinBuilt = false; connect();
+        return;
+      }
+      case 'roll': case 'buy': case 'decline': case 'pass': case 'endTurn': case 'payJail': case 'useJailCard': case 'start': case 'leave':
+        if (a === 'leave' && !confirm('Uscire dalla partita?')) return;
+        await act({ type: a }); if (a === 'leave') logout(); return;
+      case 'bid': await act({ type: 'bid', amount: Number(d.amt) }); return;
+      case 'payBanker': await act({ type: 'payBanker', id: Number(d.id), pct: Number(d.pct) }); return;
+      case 'accuseBanker': { const r = await act({ type: 'accuseBanker' }); return r; }
+      case 'hold': await act({ type: 'hold' }); return;
+      case 'heatUp': await act({ type: 'heatUp' }); return;
+      case 'snd': pSound = !pSound; try { localStorage.setItem('dv_psound', pSound ? '1' : '0'); } catch (e) { /* */ } if (pSound) { pEnsure(); psfx('gain'); } render(); return;
+      case 'help': modal = 'help'; render(); return;
+      case 'closeModal': { if (modal === 'intro' && S.gameId) { try { localStorage.setItem('dv_seen', S.gameId); } catch (e) { /* */ } } modal = null; render(); return; }
+      case 'why': if (d.w) toast(d.w, true); return;
+      case 'rinfo': if (openRules.has(d.k)) openRules.delete(d.k); else openRules.add(d.k); render(); return;
+      case 'vote': await act({ type: 'vote', key: d.k, value: d.v === '1' }); return;
+      case 'vpreset': await act({ type: 'vote', preset: d.k }); return;
+      case 'busPick': await act({ type: 'busPick', pick: d.p }); buzz(30); return;
+      case 'warpTo': { const r = await act({ type: 'warpTo', idx: Number(d.i) }); if (r.ok) pick = null; return; }
+      case 'cheat': { const r = await act({ type: 'cheat' }); if (r.ok) toast('🕵️ Fatto… nessuno ha visto'); return; }
+      case 'accuse': await act({ type: 'accuse' }); return;
+      case 'ace': {
+        const A = D.ACES[d.k];
+        if (A.target === 'none') { const r = await act({ type: 'ace', ace: d.k }); if (r.ok) buzz(40); }
+        else { pick = { kind: 'ace', key: d.k }; render(); window.scrollTo(0, 0); }
+        return;
+      }
+      case 'cancelPick': pick = null; render(); return;
+      case 'saleOpen': salePick = { to: null, price: S.buy ? S.buy.price : 100 }; render(); return;
+      case 'saleClose': salePick = null; render(); return;
+      case 'saleTo': if (salePick) salePick.to = d.id; render(); return;
+      case 'salePrice': if (salePick) salePick.price = Math.max(0, salePick.price + Number(d.d)); render(); return;
+      case 'saleSend': { if (!salePick || !salePick.to) return; const r = await act({ type: 'offerSale', to: salePick.to, price: salePick.price }); if (r.ok) salePick = null; render(); return; }
+      case 'saleAccept': case 'saleDecline': case 'saleCancel': await act({ type: a }); return;
+      case 'acetarget': { const r = await act({ type: 'ace', ace: pick.key, target: d.id }); if (r.ok) { pick = null; buzz(40); } render(); return; }
+      case 'acesq': { const r = await act({ type: 'ace', ace: pick.key, idx: Number(d.i) }); if (r.ok) { pick = null; buzz(40); } render(); return; }
+      case 'build': case 'sell': case 'mortgage': case 'unmortgage': await act({ type: a, idx: Number(d.i) }); return;
+      case 'bankrupt': if (confirm('Confermi? Perdi tutto e esci dal gioco.')) await act({ type: 'bankrupt' }); return;
+      case 'resign': if (confirm('Vuoi davvero arrenderti? Esci dal gioco e lasci tutto alla banca.')) await act({ type: 'bankrupt' }); return;
+      case 'claimTake': await act({ type: 'claimTake' }); return;
+      case 'claimPass': await act({ type: 'claimPass' }); return;
+      case 'auctionOwn': await act({ type: 'auctionOwn', idx: Number(d.i) }); return;
+      case 'travel': await act({ type: 'travel', idx: Number(d.i) }); return;
+      case 'dareYes': await act({ type: 'dareAnswer', done: true }); return;
+      case 'dareNo': await act({ type: 'dareAnswer', done: false }); return;
       case 'set': {
         const st = S.settings;
-        if (d.k === 'tableSec') { const o = [120, 240, 360]; await act({ type: 'settings', tableSec: o[(o.indexOf(st.tableSec) + 1) % 3] }); }
-        else if (d.k === 'traitors') await act({ type: 'settings', traitors: (st.traitors + 1) % 4 });
+        if (d.k === 'winWorth') { const o = [0, 3000, 5000, 8000]; await act({ type: 'settings', winWorth: o[(o.indexOf(st.winWorth) + 1) % o.length] }); }
+        else if (d.k === 'boardSize') await act({ type: 'settings', boardSize: st.boardSize === 40 ? 60 : 40 });
+        else if (d.k === 'startCash') { const o = [1000, 1500, 2000, 3000]; await act({ type: 'settings', startCash: o[(o.indexOf(st.startCash) + 1) % o.length] }); }
+        else if (d.k === 'maxRounds') { const o = [0, 20, 30, 50]; await act({ type: 'settings', maxRounds: o[(o.indexOf(st.maxRounds) + 1) % o.length] }); }
+        else if (d.k === 'auctionRound') { const o = [0, 4, 6, 10, 15]; await act({ type: 'settings', auctionRound: o[(o.indexOf(st.auctionRound) + 1) % o.length] }); }
+        else if (d.k === 'timeLimit') { const o = [0, 30, 45, 60, 90]; await act({ type: 'settings', timeLimit: o[(o.indexOf(st.timeLimit || 0) + 1) % o.length] }); }
+        else if (d.k === 'mean') await act({ type: 'settings', mean: (st.mean || 2) % 3 + 1 });
+        else if (d.k === 'theme') { const o = Object.keys(D.THEMES); await act({ type: 'settings', theme: o[(o.indexOf(st.theme) + 1) % o.length] }); }
         else await act({ type: 'settings', [d.k]: !st[d.k] });
-        break;
+        return;
       }
-      case 'reveal': revealedFor = S.gameId; sessionStorage.setItem('tr_revealed', revealedFor); render(); break;
-      case 'hide': revealedFor = ''; sessionStorage.removeItem('tr_revealed'); render(); break;
-      case 'ready': await act({ type: 'ready' }); break;
-      case 'nightGo': {
-        const mine = S.night.myPick; const target = nightSel || (mine && mine.target);
-        const rec = $('[data-act=rec]') ? $('[data-act=rec]').checked : false;
-        await act({ type: 'nightPick', target, recruit: rec }); break;
+      case 'accept': { const r = await act({ type: 'accept', id: Number(d.id) }); if (r.ok) toast('🤝 Scambio concluso!'); return; }
+      case 'reject': await act({ type: 'reject', id: Number(d.id) }); return;
+      // ---- composizione scambio ----
+      case 'tnew': draft = { to: null, offer: { cash: 0, props: [], jail: 0 }, request: { cash: 0, props: [], jail: 0 } }; render(); return;
+      case 'tcancelDraft': draft = null; render(); return;
+      case 'tto': draft.to = d.id; draft.request = { cash: 0, props: [], jail: 0 }; render(); return;
+      case 'tcash': {
+        const side = draft[d.side];
+        const max = d.side === 'offer' ? me().cash : 3000;
+        side.cash = clamp(side.cash + Number(d.d), 0, max);
+        render(); return;
       }
-      case 'recYes': await act({ type: 'recruit', yes: true }); break;
-      case 'recNo': await act({ type: 'recruit', yes: false }); break;
-      case 'sab': if (confirm('Sabotare la missione? Il premio si dimezza e nessuna saprà che sei stata tu.')) { const r = await act({ type: 'mSabotage' }); if (r.ok) toast('🗡️ Fatto… nessuna ha visto.'); } break;
-      case 'ans': { fb = { q: Number(d.q), c: Number(d.c), until: Date.now() + 750 }; render(); const r = await act({ type: 'mAnswer', q: Number(d.q), c: Number(d.c) }); setTimeout(() => { fb = null; render(); }, 800); break; }
-      case 'cdl': memTap(Number(d.i)); break;
-      case 'gc': gcTap(Number(d.i)); break;
-      case 'tready': await act({ type: 'tableReady' }); break;
-      case 'voteGo': { const t = voteSel || (S.vote && S.vote.mine); if (t) { const r = await act({ type: 'vote', target: t }); if (r.ok) { voteSel = null; toast('🗳️ Voto registrato'); } } break; }
-      case 'nskip': await act({ type: 'skip' }); break;
-      case 'next60': await act({ type: 'extend', sec: 60 }); break;
-      case 'npause': await act({ type: 'pause' }); break;
+      case 'tprop': {
+        const side = draft[d.side], i = Number(d.i);
+        side.props = side.props.includes(i) ? side.props.filter((x) => x !== i) : side.props.concat(i);
+        render(); return;
+      }
+      case 'tjail': draft[d.side].jail = draft[d.side].jail ? 0 : 1; render(); return;
+      case 'tsend': {
+        const r = await act({ type: 'propose', to: draft.to, offer: draft.offer, request: draft.request });
+        if (r.ok) { draft = null; toast('Proposta inviata!'); render(); }
+        return;
+      }
       default:
     }
   });
 
   connect();
+  setInterval(() => { if (S && delta && Date.now() > delta.until) { delta = null; } }, 1000);
 })();

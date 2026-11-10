@@ -1,8 +1,12 @@
 {
-  "name": "tradimento-al-collegio",
+  "name": "dolce-vita-monopoly",
   "version": "1.0.0",
-  "description": "Un gioco di inganni nel convento: Fedeli e Traditori. Tabellone sull'iPad e un telefono per ogni giocatrice.",
+  "description": "Gioco da tavolo digitale: iPad come tabellone, telefoni come controller.",
   "main": "server.js",
-  "scripts": { "start": "node server.js", "test": "node test.js" },
-  "engines": { "node": ">=18" }
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/rules.js && node test/simulate.js 100"
+  },
+  "engines": { "node": ">=16" },
+  "license": "MIT"
 }
